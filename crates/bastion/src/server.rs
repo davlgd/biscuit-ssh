@@ -11,21 +11,21 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use biscuit_ssh_core::api::BASTION_TOKEN_PROMPT;
 use biscuit_ssh_core::{AccessRequest, Mode, Name};
 use bytes::Bytes;
 use russh::keys::{HashAlg, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, Sig};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, oneshot, watch};
 use tracing::Instrument;
 
-use crate::access::{self, Grant};
+use crate::access::{self, Cutter, Grant, until_cut};
 use crate::config::Settings;
 use crate::relay::{self, Relay, Replies};
 use crate::target::{self, TargetConnection};
@@ -33,60 +33,55 @@ use crate::target::{self, TargetConnection};
 /// How long a forwarded request may wait for the target's answer.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Creates one [`Connection`] per client.
-pub struct Bastion {
-    /// Shared by every connection.
-    pub settings: Arc<Settings>,
-}
-
-impl russh::server::Server for Bastion {
-    type Handler = Connection;
-
-    fn new_client(&mut self, peer: Option<SocketAddr>) -> Connection {
-        let (cut_sender, cut) = watch::channel(false);
-        Connection {
-            settings: Arc::clone(&self.settings),
-            peer: peer.map(|p| p.ip().to_canonical()),
-            span: tracing::info_span!(
-                "client",
-                peer = %peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_canonical().to_string()),
-                server = tracing::field::Empty,
-            ),
-            verified_key: None,
-            grant: None,
-            cut_sender: Some(cut_sender),
-            pending_lease: None,
-            cut,
-            target: None,
-            relays: HashMap::new(),
-        }
-    }
-
-    fn handle_session_error(&mut self, error: anyhow::Error) {
-        tracing::debug!(error = %error, "connection ended with an error");
-    }
-}
-
 /// One client connection.
 pub struct Connection {
     settings: Arc<Settings>,
-    peer: Option<IpAddr>,
+    /// Bounds concurrent token checks for new logins, which are CPU-bound:
+    /// beyond it, logins are refused so lease renewals are never starved.
+    admission: Arc<Semaphore>,
+    peer: IpAddr,
     span: tracing::Span,
     /// Login name and fingerprint of the key the client proved it holds.
     verified_key: Option<(String, String)>,
-    /// Set once the token is accepted.
-    grant: Option<Arc<Grant>>,
-    /// Handed to the lease guard once authenticated.
-    cut_sender: Option<watch::Sender<bool>>,
-    /// End of the first lease and the cut switch, for the lease guard.
-    pending_lease: Option<(u64, watch::Sender<bool>)>,
-    /// Becomes true when the lease guard cuts the connection.
+    /// Set once the token is accepted, with the end of the first lease.
+    grant: Option<(Arc<Grant>, u64)>,
+    cutter: Arc<Cutter>,
+    /// Becomes true when the connection is cut.
     cut: watch::Receiver<bool>,
     target: Option<TargetConnection>,
     relays: HashMap<ChannelId, Relay>,
 }
 
+/// A request forwarded to the target, which answers it.
+enum Request<'a> {
+    Pty {
+        term: &'a str,
+        size: (u32, u32, u32, u32),
+        modes: &'a [(Pty, u32)],
+    },
+    Shell,
+    Exec(&'a [u8]),
+    Subsystem(&'a str),
+}
+
 impl Connection {
+    /// A new connection from `peer`; `cutter` closes its socket when cut.
+    pub fn new(settings: Arc<Settings>, admission: Arc<Semaphore>, peer: IpAddr, cutter: Arc<Cutter>) -> Self {
+        let peer = peer.to_canonical();
+        Self {
+            settings,
+            admission,
+            peer,
+            span: tracing::info_span!("client", %peer, server = tracing::field::Empty),
+            verified_key: None,
+            grant: None,
+            cut: cutter.watch(),
+            cutter,
+            target: None,
+            relays: HashMap::new(),
+        }
+    }
+
     /// Checks the token presented by the client for `login`.
     async fn authenticate(&mut self, login: &str, fingerprint: String, token: String) -> anyhow::Result<()> {
         let (user, server) = login.rsplit_once('@').context("the login must be user@server")?;
@@ -99,7 +94,7 @@ impl Connection {
             .clone();
         let request = AccessRequest {
             time: SystemTime::now(),
-            source_ip: self.peer.context("unknown client address")?,
+            source_ip: self.peer,
             server,
             user,
             command: None,
@@ -108,10 +103,13 @@ impl Connection {
         };
         let grant = Arc::new(Grant { token, request, target });
 
+        let permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("busy"))?;
         let (settings, checked) = (Arc::clone(&self.settings), Arc::clone(&grant));
         let authorization = tokio::task::spawn_blocking(move || {
-            let lifetime = settings.check_interval;
-            access::authorize(&settings, &checked.token, &checked.request, lifetime)
+            let _permit = permit;
+            access::authorize(&settings, &checked.token, &checked.request, settings.check_interval)
         })
         .await?
         .map_err(|refusal| anyhow!("token refused: {}", refusal.kind()))?;
@@ -120,33 +118,30 @@ impl Connection {
         tracing::info!(
             parent: &self.span,
             user = %grant.request.user,
-            server = %grant.request.server,
             key = %grant.request.public_key,
             token = authorization.token_id(),
             "authenticated"
         );
-        let cut = self.cut_sender.take().context("already authenticated")?;
-        self.grant = Some(grant);
-        self.pending_lease = Some((authorization.valid_until(), cut));
+        self.grant = Some((grant, authorization.valid_until()));
         Ok(())
     }
 
-    /// The target connection, opened on first use.
-    async fn target(&mut self) -> anyhow::Result<&TargetConnection> {
+    /// Opens the target side of a new session channel, connecting to the
+    /// target on first use.
+    async fn open_relay(&mut self, id: ChannelId, client: russh::server::Handle) -> anyhow::Result<()> {
         if self.target.is_none() {
-            let grant = Arc::clone(self.grant.as_ref().context("not authenticated")?);
-            let connection = target::connect(Arc::clone(&self.settings), grant).await?;
+            let (grant, _) = self.grant.as_ref().context("not authenticated")?;
+            let permit = Arc::clone(&self.admission).acquire_owned().await?;
+            let (connection, socket) = target::connect(Arc::clone(&self.settings), Arc::clone(grant), permit).await?;
+            self.cutter.watch_socket(socket);
             self.target = Some(connection);
         }
-        self.target.as_ref().context("no target connection")
-    }
-
-    /// Opens the target side of a new session channel.
-    async fn open_relay(&mut self, id: ChannelId, client: russh::server::Handle) -> anyhow::Result<()> {
-        let channel = self.target().await?.channel_open_session().await?;
-        let (from_target, to_target) = channel.split();
+        let target = self.target.as_ref().context("no target connection")?;
+        let (from_target, to_target) = target.channel_open_session().await?.split();
+        let to_target = Arc::new(to_target);
+        self.cutter.watch_session(&to_target);
         let replies = Replies::default();
-        let pump = relay::pump(from_target, client, id, replies.clone());
+        let pump = relay::pump(from_target, client, id, replies.clone(), self.cutter.watch());
         tokio::spawn(pump.instrument(self.span.clone()));
         self.relays.insert(id, Relay { to_target, replies });
         Ok(())
@@ -156,42 +151,40 @@ impl Connection {
         self.relays.get(&id).context("unknown channel")
     }
 
-    /// Fails once the lease guard has cut the connection.
-    fn check_not_cut(&self) -> anyhow::Result<()> {
-        if *self.cut.borrow() {
-            bail!("connection cut");
-        }
-        Ok(())
+    /// Forwards `request` to the target; the receiver gets its answer.
+    async fn forward(&self, id: ChannelId, request: Request<'_>) -> anyhow::Result<oneshot::Receiver<bool>> {
+        until_cut(self.cut.clone(), async {
+            let relay = self.relay(id)?;
+            let reply = relay.replies.expect();
+            let to_target = &relay.to_target;
+            match request {
+                Request::Pty { term, size, modes } => {
+                    let (columns, rows, width, height) = size;
+                    to_target
+                        .request_pty(true, term, columns, rows, width, height, modes)
+                        .await
+                }
+                Request::Shell => to_target.request_shell(true).await,
+                Request::Exec(command) => to_target.exec(true, command).await,
+                Request::Subsystem(name) => to_target.request_subsystem(true, name).await,
+            }?;
+            Ok(reply)
+        })
+        .await
     }
 
-    /// Waits for the target's answer to a forwarded request and relays it,
-    /// unless the connection is cut first.
-    async fn answer(
-        &mut self,
-        id: ChannelId,
-        reply: tokio::sync::oneshot::Receiver<bool>,
-        session: &mut Session,
-    ) -> anyhow::Result<()> {
-        let mut cut = self.cut.clone();
-        let accepted = tokio::select! {
-            answer = tokio::time::timeout(REPLY_TIMEOUT, reply) => matches!(answer, Ok(Ok(true))),
-            _ = cut.wait_for(|cut| *cut) => bail!("connection cut"),
-        };
-        if accepted {
+    /// Waits for the target's answer to a forwarded request and relays it.
+    async fn answer(&self, id: ChannelId, reply: oneshot::Receiver<bool>, session: &mut Session) -> anyhow::Result<()> {
+        let answer = until_cut(self.cut.clone(), async {
+            Ok(tokio::time::timeout(REPLY_TIMEOUT, reply).await)
+        })
+        .await?;
+        if matches!(answer, Ok(Ok(true))) {
             session.channel_success(id)?;
         } else {
             session.channel_failure(id)?;
         }
         Ok(())
-    }
-
-    /// Sends data to the target, unless the connection is cut first.
-    async fn forward_data(&self, id: ChannelId, data: &[u8]) -> anyhow::Result<()> {
-        let mut cut = self.cut.clone();
-        tokio::select! {
-            sent = self.relay(id)?.to_target.data_bytes(Bytes::copy_from_slice(data)) => Ok(sent?),
-            _ = cut.wait_for(|cut| *cut) => bail!("connection cut"),
-        }
     }
 }
 
@@ -263,9 +256,14 @@ impl russh::server::Handler for Connection {
     }
 
     async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
-        let grant = Arc::clone(self.grant.as_ref().context("no grant")?);
-        let (lease_end, cut) = self.pending_lease.take().context("no lease")?;
-        let guard = access::guard(Arc::clone(&self.settings), grant, lease_end, session.handle(), cut);
+        let (grant, lease_end) = self.grant.as_ref().context("no grant")?;
+        let guard = access::guard(
+            Arc::clone(&self.settings),
+            Arc::clone(grant),
+            *lease_end,
+            session.handle(),
+            Arc::clone(&self.cutter),
+        );
         tokio::spawn(guard.instrument(self.span.clone()));
         Ok(())
     }
@@ -279,8 +277,9 @@ impl russh::server::Handler for Connection {
         // Requests are handled through the callbacks below, not the channel.
         let id = channel.id();
         drop(channel);
-        self.check_not_cut()?;
-        match self.open_relay(id, session.handle()).await {
+        let client = session.handle();
+        let cut = self.cut.clone();
+        match until_cut(cut, self.open_relay(id, client)).await {
             Ok(()) => reply.accept().await,
             Err(error) => {
                 tracing::warn!(parent: &self.span, error = %error, "cannot reach the target");
@@ -301,40 +300,26 @@ impl russh::server::Handler for Connection {
         modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
-        let relay = self.relay(id)?;
-        let reply = relay.replies.expect();
-        relay
-            .to_target
-            .request_pty(true, term, col_width, row_height, pix_width, pix_height, modes)
-            .await?;
+        let size = (col_width, row_height, pix_width, pix_height);
+        let reply = self.forward(id, Request::Pty { term, size, modes }).await?;
         self.answer(id, reply, session).await
     }
 
     async fn shell_request(&mut self, id: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
         tracing::info!(parent: &self.span, "shell");
-        let relay = self.relay(id)?;
-        let reply = relay.replies.expect();
-        relay.to_target.request_shell(true).await?;
+        let reply = self.forward(id, Request::Shell).await?;
         self.answer(id, reply, session).await
     }
 
     async fn exec_request(&mut self, id: ChannelId, command: &[u8], session: &mut Session) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
         tracing::info!(parent: &self.span, command = %String::from_utf8_lossy(command), "exec");
-        let relay = self.relay(id)?;
-        let reply = relay.replies.expect();
-        relay.to_target.exec(true, command).await?;
+        let reply = self.forward(id, Request::Exec(command)).await?;
         self.answer(id, reply, session).await
     }
 
     async fn subsystem_request(&mut self, id: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
         tracing::info!(parent: &self.span, subsystem = name, "subsystem");
-        let relay = self.relay(id)?;
-        let reply = relay.replies.expect();
-        relay.to_target.request_subsystem(true, name).await?;
+        let reply = self.forward(id, Request::Subsystem(name)).await?;
         self.answer(id, reply, session).await
     }
 
@@ -365,36 +350,43 @@ impl russh::server::Handler for Connection {
         pix_height: u32,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
-        let relay = self.relay(id)?;
-        relay
-            .to_target
-            .window_change(col_width, row_height, pix_width, pix_height)
-            .await?;
-        Ok(())
+        until_cut(self.cut.clone(), async {
+            let to_target = &self.relay(id)?.to_target;
+            Ok(to_target
+                .window_change(col_width, row_height, pix_width, pix_height)
+                .await?)
+        })
+        .await
     }
 
     async fn signal(&mut self, id: ChannelId, signal: Sig, _: &mut Session) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
-        self.relay(id)?.to_target.signal(signal).await?;
-        Ok(())
+        until_cut(self.cut.clone(), async {
+            Ok(self.relay(id)?.to_target.signal(signal).await?)
+        })
+        .await
     }
 
     async fn data(&mut self, id: ChannelId, data: &[u8], _: &mut Session) -> Result<(), Self::Error> {
-        self.check_not_cut()?;
-        self.forward_data(id, data).await
+        until_cut(self.cut.clone(), async {
+            let to_target = &self.relay(id)?.to_target;
+            Ok(to_target.data_bytes(Bytes::copy_from_slice(data)).await?)
+        })
+        .await
     }
 
     async fn channel_eof(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
-        if let Some(relay) = self.relays.get(&id) {
-            relay.to_target.eof().await?;
-        }
-        Ok(())
+        until_cut(self.cut.clone(), async {
+            if let Some(relay) = self.relays.get(&id) {
+                relay.to_target.eof().await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn channel_close(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
         if let Some(relay) = self.relays.remove(&id) {
-            let _ = relay.to_target.close().await;
+            let _ = until_cut(self.cut.clone(), async { Ok(relay.to_target.close().await?) }).await;
         }
         Ok(())
     }

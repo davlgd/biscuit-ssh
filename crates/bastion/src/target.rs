@@ -14,6 +14,7 @@ use russh::keys::{Certificate, PrivateKey, PublicKey, PublicKeyOrCertificate};
 use ssh_key::LineEnding;
 use ssh_key::rand_core::OsRng;
 use tokio::net::TcpStream;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::access::Grant;
 use crate::config::Settings;
@@ -45,22 +46,44 @@ impl client::Handler for TargetHost {
 }
 
 /// Connects to the target of `grant` and logs in as its user.
-pub async fn connect(settings: Arc<Settings>, grant: Arc<Grant>) -> anyhow::Result<TargetConnection> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant))
+///
+/// Also returns a duplicate of the connection's socket, to close it
+/// whatever the state of the SSH session. `permit` bounds the CPU spent on
+/// the token check.
+pub async fn connect(
+    settings: Arc<Settings>,
+    grant: Arc<Grant>,
+    permit: OwnedSemaphorePermit,
+) -> anyhow::Result<(TargetConnection, std::net::TcpStream)> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant, permit))
         .await
         .context("connection to the target timed out")?
 }
 
-async fn connect_inner(settings: Arc<Settings>, grant: Arc<Grant>) -> anyhow::Result<TargetConnection> {
+async fn connect_inner(
+    settings: Arc<Settings>,
+    grant: Arc<Grant>,
+    permit: OwnedSemaphorePermit,
+) -> anyhow::Result<(TargetConnection, std::net::TcpStream)> {
     let stream = TcpStream::connect(grant.target.address)
         .await
         .with_context(|| format!("cannot connect to {}", grant.target.address))?;
+    let socket = stream.into_std()?;
+    let duplicate = socket.try_clone()?;
+    let stream = TcpStream::from_std(socket)?;
     // The address the target sees, which the certificate is pinned to.
-    let bastion_ip = stream.local_addr()?.ip();
+    let bastion_ip = match grant.target.source_address {
+        Some(address) => address,
+        None => stream.local_addr()?.ip(),
+    };
 
     let (key, certificate) = {
         let (settings, grant) = (Arc::clone(&settings), Arc::clone(&grant));
-        tokio::task::spawn_blocking(move || login_credentials(&settings, &grant, bastion_ip)).await??
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            login_credentials(&settings, &grant, bastion_ip)
+        })
+        .await??
     };
 
     let config = Arc::new(client::Config::default());
@@ -75,7 +98,7 @@ async fn connect_inner(settings: Arc<Settings>, grant: Arc<Grant>) -> anyhow::Re
         .authenticate_openssh_cert(user, Arc::new(key), certificate)
         .await?
     {
-        AuthResult::Success => Ok(connection),
+        AuthResult::Success => Ok((connection, duplicate)),
         AuthResult::Failure { .. } => bail!("the target refused the bastion certificate"),
     }
 }

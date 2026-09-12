@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use russh::ChannelId;
 use russh::ChannelMsg;
 use russh::{ChannelReadHalf, ChannelWriteHalf};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// The target side of a relayed channel.
 pub struct Relay {
-    /// Sends to the target.
-    pub to_target: ChannelWriteHalf<russh::client::Msg>,
+    /// Sends to the target; shared with the connection's cutter.
+    pub to_target: Arc<ChannelWriteHalf<russh::client::Msg>>,
     /// Waiting for the target's answers, in request order.
     pub replies: Replies,
 }
@@ -52,9 +52,22 @@ impl Replies {
 }
 
 /// Copies what the target sends on a channel to the client, until either
-/// side closes it.
-pub async fn pump(mut from_target: ChannelReadHalf, client: russh::server::Handle, id: ChannelId, replies: Replies) {
-    while let Some(message) = from_target.wait().await {
+/// side closes it or the connection is cut.
+pub async fn pump(
+    mut from_target: ChannelReadHalf,
+    client: russh::server::Handle,
+    id: ChannelId,
+    replies: Replies,
+    mut cut: watch::Receiver<bool>,
+) {
+    loop {
+        let message = tokio::select! {
+            message = from_target.wait() => message,
+            _ = cut.wait_for(|cut| *cut) => break,
+        };
+        let Some(message) = message else {
+            break;
+        };
         let delivered = match message {
             ChannelMsg::Data { data } => client.data(id, data).await.is_ok(),
             ChannelMsg::ExtendedData { data, ext } => client.extended_data(id, ext, data).await.is_ok(),

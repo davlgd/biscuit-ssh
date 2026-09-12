@@ -16,13 +16,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
-use russh::server::Server as _;
-use russh::{MethodKind, MethodSet};
-use tokio::net::TcpListener;
+use std::net::IpAddr;
 
-use crate::config::Config;
-use crate::server::Bastion;
+use clap::Parser;
+use russh::{MethodKind, MethodSet};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+use crate::access::Cutter;
+use crate::config::{Config, Settings};
+use crate::server::Connection;
 
 #[derive(Parser)]
 #[command(version, about = "SSH bastion checking Biscuit tokens")]
@@ -37,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     biscuit_ssh_service::init_tracing();
     let args = Args::parse();
     let config = Config::load(&args.config)?;
-    let settings = config.settings()?;
+    let settings = Arc::new(config.settings()?);
 
     let ssh = Arc::new(russh::server::Config {
         keys: vec![settings.host_key.clone()],
@@ -48,18 +51,48 @@ async fn main() -> anyhow::Result<()> {
         keepalive_interval: Some(Duration::from_secs(30)),
         ..Default::default()
     });
+    let admission = Arc::new(Semaphore::new(
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    ));
     let listener = TcpListener::bind(config.listen).await?;
     tracing::info!(listen = %config.listen, targets = settings.targets.len(), "listening");
 
-    let mut bastion = Bastion {
-        settings: Arc::new(settings),
-    };
-    let running = bastion.run_on_socket(ssh, &listener);
-    let handle = running.handle();
-    tokio::spawn(async move {
-        biscuit_ssh_service::shutdown_signal().await;
-        handle.shutdown("bastion shutting down".to_owned());
-    });
-    running.await?;
+    let shutdown = biscuit_ssh_service::shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot accept a connection");
+                    continue;
+                }
+            },
+            () = &mut shutdown => return Ok(()),
+        };
+        let (settings, ssh, admission) = (Arc::clone(&settings), Arc::clone(&ssh), Arc::clone(&admission));
+        tokio::spawn(async move {
+            if let Err(error) = serve(settings, ssh, admission, stream, peer.ip()).await {
+                tracing::debug!(%peer, error = %error, "connection ended with an error");
+            }
+        });
+    }
+}
+
+/// Runs the SSH session of one client.
+async fn serve(
+    settings: Arc<Settings>,
+    ssh: Arc<russh::server::Config>,
+    admission: Arc<Semaphore>,
+    stream: TcpStream,
+    peer: IpAddr,
+) -> anyhow::Result<()> {
+    // A duplicate of the socket lets a cut close it whatever the state of
+    // the SSH session.
+    let socket = stream.into_std()?;
+    let cutter = Cutter::new(socket.try_clone()?);
+    let stream = TcpStream::from_std(socket)?;
+    let connection = Connection::new(settings, admission, peer, cutter);
+    russh::server::run_stream(ssh, stream, connection).await?.await?;
     Ok(())
 }

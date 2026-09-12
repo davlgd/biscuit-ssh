@@ -16,10 +16,13 @@
 //! [targets.web-1]
 //! address = "10.0.0.5:22"
 //! host_key = "ssh-ed25519 AAAA..."   # the server's host public key
+//! # Optional: the bastion's address as this server sees it, when network
+//! # address translation hides the local one (certificates are pinned to it).
+//! source_address = "192.0.2.1"
 //! ```
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -57,6 +60,7 @@ pub struct Config {
 struct TargetConfig {
     address: SocketAddr,
     host_key: String,
+    source_address: Option<IpAddr>,
 }
 
 /// A server reachable through the bastion.
@@ -66,6 +70,9 @@ pub struct Target {
     pub address: SocketAddr,
     /// Its host key: connections presenting another key are refused.
     pub host_key: PublicKey,
+    /// The bastion's address as the target sees it, when address
+    /// translation hides the local one.
+    pub source_address: Option<IpAddr>,
 }
 
 /// Everything the bastion needs, validated and loaded.
@@ -114,6 +121,7 @@ impl Config {
                     Target {
                         address: target.address,
                         host_key,
+                        source_address: target.source_address,
                     },
                 ))
             })

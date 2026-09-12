@@ -5,13 +5,14 @@
 //! again for the next window, starting exactly where the lease ends, so the
 //! covered time is contiguous and every second the token refuses is caught.
 //! The connection is cut when the token stops allowing access, at that exact
-//! second, and at once if it is revoked or cannot be checked.
+//! second, and at once if it is revoked or cannot be checked (so within
+//! `session_check_interval` of a revocation).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use biscuit_ssh_core::{AccessRequest, Authorization};
-use russh::Disconnect;
+use russh::{Disconnect, Sig};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -92,23 +93,21 @@ pub fn authorize(
 }
 
 /// Keeps renewing the lease of a connection until the token stops allowing
-/// it, then cuts the connection: `cut` is set, so pending requests fail, and
-/// the client is disconnected.
+/// it, then cuts the connection.
 ///
-/// Returns early, without cutting, once the connection is gone (every
-/// receiver of `cut` dropped).
+/// Returns early, without cutting, once the connection is gone.
 pub async fn guard(
     settings: Arc<Settings>,
     grant: Arc<Grant>,
     mut lease_end: u64,
     client: russh::server::Handle,
-    cut: watch::Sender<bool>,
+    cutter: Arc<Cutter>,
 ) {
     let reason = loop {
         let deadline = instant_at(lease_end);
         tokio::select! {
             () = tokio::time::sleep_until(instant_at(lease_end.saturating_sub(RENEWAL_MARGIN))) => {}
-            () = cut.closed() => return,
+            () = cutter.gone() => return,
         }
         let (settings, grant) = (Arc::clone(&settings), Arc::clone(&grant));
         let start = UNIX_EPOCH + Duration::from_secs(lease_end);
@@ -120,7 +119,7 @@ pub async fn guard(
                     // Still allowed until the lease ends, not a second more.
                     tokio::select! {
                         () = tokio::time::sleep_until(deadline) => {}
-                        () = cut.closed() => return,
+                        () = cutter.gone() => return,
                     }
                     break "access expired";
                 }
@@ -128,18 +127,105 @@ pub async fn guard(
                 Err(_) => break "internal error",
             },
             () = tokio::time::sleep_until(deadline) => break "renewal too slow",
-            () = cut.closed() => return,
+            () = cutter.gone() => return,
         }
     };
     tracing::warn!(reason, "session cut");
-    let _ = cut.send(true);
-    let _ = client
-        .disconnect(
-            Disconnect::ByApplication,
-            format!("biscuit-ssh: {reason}"),
-            String::new(),
-        )
-        .await;
+    cutter.cut(&client, reason).await;
+}
+
+/// Cuts a connection for good: flags it so pending operations fail, tells
+/// the client why, hangs up the target sessions, then closes the client and
+/// target sockets. Closing the sockets is what guarantees the cut: russh
+/// sessions run in background tasks that a stalled peer could otherwise
+/// keep alive.
+pub struct Cutter {
+    flag: watch::Sender<bool>,
+    sockets: Mutex<Vec<std::net::TcpStream>>,
+    sessions: Mutex<Vec<Weak<TargetSession>>>,
+}
+
+/// The sending side of a target session channel.
+pub type TargetSession = russh::ChannelWriteHalf<russh::client::Msg>;
+
+/// How long a cut connection may wind down gracefully (hang-ups and
+/// disconnection notice sent) before its sockets are closed.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
+
+/// Time left to queued messages once the connection is gone.
+const FLUSH_DELAY: Duration = Duration::from_millis(200);
+
+impl Cutter {
+    /// A cutter for a connection on `client_socket` (a duplicate of the
+    /// socket the SSH session uses).
+    pub fn new(client_socket: std::net::TcpStream) -> Arc<Self> {
+        Arc::new(Self {
+            flag: watch::channel(false).0,
+            sockets: Mutex::new(vec![client_socket]),
+            sessions: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Also closes `socket` on cut.
+    pub fn watch_socket(&self, socket: std::net::TcpStream) {
+        lock(&self.sockets).push(socket);
+    }
+
+    /// Also hangs up `session` on cut, while it is open.
+    pub fn watch_session(&self, session: &Arc<TargetSession>) {
+        let mut sessions = lock(&self.sessions);
+        sessions.retain(|session| session.strong_count() > 0);
+        sessions.push(Arc::downgrade(session));
+    }
+
+    /// Becomes true when the connection is cut. The connection counts as
+    /// gone once every receiver is dropped.
+    pub fn watch(&self) -> watch::Receiver<bool> {
+        self.flag.subscribe()
+    }
+
+    async fn gone(&self) {
+        self.flag.closed().await;
+    }
+
+    async fn cut(&self, client: &russh::server::Handle, reason: &str) {
+        self.flag.send_replace(true);
+        let sessions: Vec<_> = lock(&self.sessions).iter().filter_map(Weak::upgrade).collect();
+        let farewell = async {
+            // Commands started without a terminal would survive a mere
+            // disconnect: sshd only hangs up terminals.
+            for session in sessions {
+                let _ = session.signal(Sig::HUP).await;
+            }
+            let notice = format!("biscuit-ssh: {reason}");
+            let _ = client
+                .disconnect(Disconnect::ByApplication, notice, String::new())
+                .await;
+            // Messages are only queued: let the sessions send them and end.
+            self.gone().await;
+            tokio::time::sleep(FLUSH_DELAY).await;
+        };
+        let _ = tokio::time::timeout(DISCONNECT_GRACE, farewell).await;
+        for socket in lock(&self.sockets).iter() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // A poisoned lock only means a panic elsewhere; the list is intact.
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs `work` unless the connection is cut first, as `cut` reports.
+pub async fn until_cut<T>(
+    mut cut: watch::Receiver<bool>,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        result = work => result,
+        _ = cut.wait_for(|cut| *cut) => anyhow::bail!("connection cut"),
+    }
 }
 
 /// The instant corresponding to `seconds` since the Unix epoch, or now if

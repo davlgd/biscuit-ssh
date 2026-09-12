@@ -124,7 +124,11 @@ fn split_host_port(address: &str) -> anyhow::Result<(&str, Option<&str>)> {
     let (host, port) = match address.strip_prefix('[') {
         Some(rest) => {
             let (host, rest) = rest.split_once(']').context("unclosed [ in the bastion address")?;
-            (host, rest.strip_prefix(':'))
+            let port = match rest {
+                "" => None,
+                _ => Some(rest.strip_prefix(':').context("unexpected text after ]")?),
+            };
+            (host, port)
         }
         None => match address.split_once(':') {
             Some((host, port)) => (host, Some(port)),
@@ -264,7 +268,17 @@ mod tests {
             split_host_port("[2001:db8::1]:2200").unwrap(),
             ("2001:db8::1", Some("2200"))
         );
-        for bad in ["", ":22", "bastion:ssh", "bastion:70000", "-oProxyCommand=x", "[::1"] {
+        for bad in [
+            "",
+            ":22",
+            "bastion:ssh",
+            "bastion:70000",
+            "-oProxyCommand=x",
+            "[::1",
+            "[::1]garbage",
+            "[bastion]ignored",
+            "[::1]:",
+        ] {
             assert!(split_host_port(bad).is_err(), "{bad}");
         }
     }
