@@ -1,13 +1,16 @@
-//! `biscuit-ssh ssh`: gets a certificate, then connects with it.
+//! `biscuit-ssh ssh`: connects with a certificate from the issuer, or
+//! through the bastion.
 
 use std::process::Command;
 
 use anyhow::Context;
 
+use crate::askpass;
 use crate::login::{Login, Options, login};
 
 /// Gets a certificate and connects with it, e.g.
-/// `biscuit-ssh ssh deploy@web-1.example.com -p 2222 uptime`.
+/// `biscuit-ssh ssh deploy@web-1.example.com -p 2222 uptime`, or connects
+/// through a bastion with `--bastion`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// Where to connect, as `user@host`.
@@ -15,6 +18,11 @@ pub struct Args {
     /// Server name in the token [default: the host of DESTINATION].
     #[arg(long)]
     server: Option<String>,
+    /// Connect through this bastion, `host` or `host:port`, instead of
+    /// getting a certificate: DESTINATION is then `user@server`, with the
+    /// server named as in the token.
+    #[arg(long, value_name = "HOST[:PORT]", conflicts_with = "server")]
+    bastion: Option<String>,
     #[command(flatten)]
     options: Options,
     /// Passed to `ssh` after the destination, as with `ssh` itself: options,
@@ -30,9 +38,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .rsplit_once('@')
         .filter(|(user, host)| !user.is_empty() && !host.is_empty() && !user.starts_with('-'))
         .context("the destination must be user@host")?;
-    let server = args.server.as_deref().unwrap_or(host);
-    let login = login(&args.options, server, user)?;
-    let mut ssh = ssh_command(&login, &args.destination, &args.ssh_args)?;
+    let mut ssh = match &args.bastion {
+        Some(bastion) => bastion_command(&args.options, bastion, &args.destination, &args.ssh_args)?,
+        None => {
+            let server = args.server.as_deref().unwrap_or(host);
+            let login = login(&args.options, server, user)?;
+            ssh_command(&login, &args.destination, &args.ssh_args)?
+        }
+    };
 
     #[cfg(unix)]
     {
@@ -79,6 +92,49 @@ fn ssh_command(login: &Login, destination: &str, ssh_args: &[String]) -> anyhow:
         .arg(destination)
         .args(ssh_args);
     Ok(ssh)
+}
+
+/// The `ssh` invocation logging in to the bastion as `user@server`, with
+/// `biscuit-ssh` answering its token prompt (see [`crate::askpass`]).
+///
+/// The token reaches the askpass process through the environment, which
+/// only processes of the same user can read.
+fn bastion_command(options: &Options, bastion: &str, login: &str, ssh_args: &[String]) -> anyhow::Result<Command> {
+    let (host, port) = split_host_port(bastion)?;
+    let identity = options.identity()?;
+    let myself = std::env::current_exe().context("cannot locate biscuit-ssh")?;
+
+    let mut ssh = Command::new("ssh");
+    ssh.env("SSH_ASKPASS", myself)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env(askpass::TOKEN_ENV, options.token()?)
+        .arg("-i")
+        .arg(identity)
+        .args(["-o", "IdentitiesOnly=yes"])
+        .args(["-o", "PreferredAuthentications=publickey,keyboard-interactive"]);
+    if let Some(port) = port {
+        ssh.args(["-p", port]);
+    }
+    ssh.args(["-l", login]).arg(host).args(ssh_args);
+    Ok(ssh)
+}
+
+/// Splits `host`, `host:port` or `[ipv6]:port`.
+fn split_host_port(address: &str) -> anyhow::Result<(&str, Option<&str>)> {
+    let (host, port) = match address.strip_prefix('[') {
+        Some(rest) => {
+            let (host, rest) = rest.split_once(']').context("unclosed [ in the bastion address")?;
+            (host, rest.strip_prefix(':'))
+        }
+        None => match address.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (address, None),
+        },
+    };
+    if host.is_empty() || host.starts_with('-') || port.is_some_and(|p| p.parse::<u16>().is_err()) {
+        anyhow::bail!("the bastion must be host, host:port or [ipv6]:port");
+    }
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -198,5 +254,18 @@ mod tests {
             .critical_option("source-address", source)
             .unwrap();
         builder.sign(&ca).unwrap()
+    }
+
+    #[test]
+    fn splits_bastion_addresses() {
+        assert_eq!(split_host_port("bastion").unwrap(), ("bastion", None));
+        assert_eq!(split_host_port("bastion:2200").unwrap(), ("bastion", Some("2200")));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:2200").unwrap(),
+            ("2001:db8::1", Some("2200"))
+        );
+        for bad in ["", ":22", "bastion:ssh", "bastion:70000", "-oProxyCommand=x", "[::1"] {
+            assert!(split_host_port(bad).is_err(), "{bad}");
+        }
     }
 }

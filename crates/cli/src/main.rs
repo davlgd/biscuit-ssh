@@ -1,6 +1,7 @@
 //! `biscuit-ssh`: gets SSH certificates from the issuer, restricts and
 //! inspects tokens, and administers root keys.
 
+mod askpass;
 mod login;
 mod restrict;
 mod ssh;
@@ -76,6 +77,9 @@ enum AdminCommand {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = askpass::run_if_requested() {
+        return result;
+    }
     match Cli::parse().command {
         Command::Login(args) => login::run(args),
         Command::Ssh(args) => ssh::run(args),

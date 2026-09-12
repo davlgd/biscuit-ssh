@@ -35,7 +35,7 @@ pub struct Args {
 pub struct Options {
     /// Issuer URL, e.g. `https://ssh-ca.example.com`.
     #[arg(long, env = "BISCUIT_SSH_ISSUER")]
-    issuer: String,
+    issuer: Option<String>,
     /// Token file, `-` for standard input.
     #[arg(short, long, env = "BISCUIT_SSH_TOKEN_FILE", default_value = "-")]
     token: PathBuf,
@@ -50,6 +50,30 @@ pub struct Options {
     /// web PKI, e.g. for a private deployment.
     #[arg(long, value_name = "FILE")]
     issuer_ca: Option<PathBuf>,
+}
+
+impl Options {
+    /// The issuer URL, required to get certificates.
+    fn issuer(&self) -> anyhow::Result<&str> {
+        self.issuer
+            .as_deref()
+            .context("no issuer: use --issuer or set BISCUIT_SSH_ISSUER")
+    }
+
+    /// The SSH private key to use.
+    pub fn identity(&self) -> anyhow::Result<PathBuf> {
+        match &self.identity {
+            Some(path) => Ok(path.clone()),
+            None => Ok(
+                Path::new(&std::env::var("HOME").context("HOME is not set, use --identity")?).join(".ssh/id_ed25519"),
+            ),
+        }
+    }
+
+    /// The token, from its file or standard input.
+    pub fn token(&self) -> anyhow::Result<String> {
+        read_token(&self.token)
+    }
 }
 
 /// A certificate obtained and installed.
@@ -70,18 +94,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// Requests a certificate for `user` on `server` and writes it next to the
 /// identity.
 pub fn login(options: &Options, server: &str, user: &str) -> anyhow::Result<Login> {
-    let url = endpoint(&options.issuer, "certificates")?;
-    let identity = match &options.identity {
-        Some(path) => path.clone(),
-        None => Path::new(&std::env::var("HOME").context("HOME is not set, use --identity")?).join(".ssh/id_ed25519"),
-    };
+    let url = endpoint(options.issuer()?, "certificates")?;
+    let identity = options.identity()?;
     let public_key_path = with_suffix(&identity, ".pub");
     let public_key = std::fs::read_to_string(&public_key_path)
         .with_context(|| format!("cannot read {}", public_key_path.display()))?;
     let key = parse_public_key(&public_key)?;
 
     let request = CertificateRequest {
-        token: read_token(&options.token)?,
+        token: options.token()?,
         public_key: public_key.trim().to_owned(),
         server: server.to_owned(),
         user: user.to_owned(),
@@ -144,7 +165,7 @@ fn explain(
     time: u64,
 ) -> String {
     let failed = (|| -> anyhow::Result<Vec<String>> {
-        let url = endpoint(&options.issuer, "root-key")?;
+        let url = endpoint(options.issuer()?, "root-key")?;
         let root_key: PublicKey = agent
             .get(&url)
             .call()?
