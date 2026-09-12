@@ -10,6 +10,9 @@
 //! | command | critical option `force-command` |
 //! | token validity | `valid-before` = [`Authorization::valid_until`] |
 //!
+//! Through the bastion, [`CertificateAuthority::sign_relayed`] certifies the
+//! bastion's own key instead, with `source-address` pinned to the bastion.
+//!
 //! Only `permit-pty` is granted: no agent, port or X11 forwarding, and no
 //! `~/.ssh/rc`. Servers trust the CA with `TrustedUserCAKeys` and map
 //! accounts to principals with `AuthorizedPrincipalsFile`.
@@ -20,6 +23,7 @@
 
 #![warn(missing_docs)]
 
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -128,7 +132,38 @@ impl CertificateAuthority {
         if request.mode != Mode::Certificate {
             return Err(Error::Mismatch("the authorization is not for a certificate"));
         }
+        self.certify(key, authorization, request.source_ip, skew)
+    }
 
+    /// Signs a certificate for the bastion's own `key`, to open the target
+    /// session of a relayed connection.
+    ///
+    /// The authorization must be for bastion mode. The certificate is pinned
+    /// to `bastion_ip`, the bastion's address as seen by targets, so it is
+    /// useless from anywhere else. `key` is not checked against the
+    /// authorization: the bastion generates it for this connection only.
+    pub fn sign_relayed(
+        &self,
+        key: &PublicKey,
+        authorization: &Authorization,
+        bastion_ip: IpAddr,
+        skew: Duration,
+    ) -> Result<Certificate, Error> {
+        if authorization.request().mode != Mode::Bastion {
+            return Err(Error::Mismatch("the authorization is not for the bastion"));
+        }
+        self.certify(key, authorization, bastion_ip, skew)
+    }
+
+    /// Signs what `authorization` allows, for connections from `source`.
+    fn certify(
+        &self,
+        key: &PublicKey,
+        authorization: &Authorization,
+        source: IpAddr,
+        skew: Duration,
+    ) -> Result<Certificate, Error> {
+        let request = authorization.request();
         let valid_after = authorization.valid_from().saturating_sub(skew.as_secs());
         let mut builder = Builder::new_with_random_nonce(
             &mut OsRng,
@@ -143,7 +178,7 @@ impl CertificateAuthority {
             // revocation list as is.
             .key_id(authorization.token_id())?
             .valid_principal(principal(&request.server, &request.user))?
-            .critical_option("source-address", Network::host(request.source_ip).to_string())?
+            .critical_option("source-address", Network::host(source).to_string())?
             .extension("permit-pty", "")?;
         if let Some(command) = &request.command {
             builder.critical_option("force-command", command.as_str())?;
@@ -239,6 +274,27 @@ k0rB3JgoZjw/ealQ==
             ca.sign(key.public_key(), &bastion, Duration::ZERO),
             Err(Error::Mismatch(_))
         ));
+        let bastion_ip = "10.0.0.1".parse().unwrap();
+        assert!(matches!(
+            ca.sign_relayed(key.public_key(), &auth, bastion_ip, Duration::ZERO),
+            Err(Error::Mismatch(_))
+        ));
+    }
+
+    #[test]
+    fn relayed_certificate_is_pinned_to_the_bastion() {
+        let ca = ca();
+        let client_key = random_key();
+        let auth = authorize(client_key.public_key(), None, Mode::Bastion);
+        let bastion_key = random_key();
+        let bastion_ip = "10.0.0.1".parse().unwrap();
+        let cert = ca
+            .sign_relayed(bastion_key.public_key(), &auth, bastion_ip, Duration::ZERO)
+            .unwrap();
+        assert_eq!(cert.public_key(), bastion_key.public_key().key_data());
+        assert_eq!(cert.valid_principals(), ["web-1:deploy"]);
+        assert_eq!(cert.critical_options().get("source-address").unwrap(), "10.0.0.1/32");
+        assert_eq!(cert.valid_before(), auth.valid_until());
     }
 
     #[test]
