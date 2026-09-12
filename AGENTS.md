@@ -11,7 +11,7 @@ Give third parties SSH access to servers through [Biscuit](https://www.biscuitse
 Servers only trust an OpenSSH user CA (`TrustedUserCAKeys` + `AuthorizedPrincipalsFile`). Nothing Biscuit-specific runs on them. Two ways to reach them, sharing the same authorization core:
 
 - **Issuer**: a third party exchanges a Biscuit and an SSH public key for a short-lived OpenSSH certificate. Biscuit constraints are translated into certificate constraints enforced by `sshd` itself (`valid-before`, `source-address`, principals, `force-command`, `permit-*` extensions).
-- **Bastion** (later): an SSH proxy that verifies the Biscuit at connection time, then reaches the target with an ephemeral certificate signed by the same CA. Used when in-session control is needed (per-command checks, cut at expiry, recording).
+- **Bastion**: an SSH server that verifies the Biscuit at login (public key, then token through keyboard-interactive), then relays session channels to targets only it can reach, logging in with an ephemeral key and a certificate from the same CA pinned to its own address. It keeps re-evaluating the token (leases of `session_check_interval`) and cuts connections at the exact second the token stops allowing them, at once on revocation. Per-command control and session recording come next.
 
 Cargo workspace layout:
 
@@ -19,9 +19,10 @@ Cargo workspace layout:
 crates/
 ├── core/      # fact vocabulary, verifier, token minting/attenuation, revocation, API messages (single source of truth)
 ├── ca/        # OpenSSH certificate signing, shared by issuer and bastion
+├── service/   # plumbing shared by the services: authority (verifier, CA, revocations), logging, shutdown
 ├── issuer/    # binary `biscuit-ssh-issuer`: HTTP API, Biscuit → certificate
-├── bastion/   # binary: SSH proxy verifying Biscuit (not started yet)
-└── cli/       # binary `biscuit-ssh`: login, token attenuation/inspection, admin (root keys, minting)
+├── bastion/   # binary `biscuit-ssh-bastion`: token-checked SSH relay (russh)
+└── cli/       # binary `biscuit-ssh`: login, ssh (direct or through the bastion), token attenuation/inspection, admin
 tests/e2e.sh   # end-to-end scenarios against a real deployment
 ```
 
@@ -31,7 +32,13 @@ Checks in a Biscuit are opaque predicates: never try to extract values from them
 
 The fact vocabulary, documented in `crates/core/src/vocabulary.rs`, is the public contract with token holders: changing it is a breaking change. Minting and attenuation only ever add `right` facts (authority block) and checks, never request facts.
 
-A certificate is derived from an `Authorization` only, which embeds the request it was granted for: principal `server:user`, `source-address` pinned to the client address, `force-command` when requested. Its validity is never longer than what the token allows: the verifier evaluates the token at every second of the certificate lifetime (Biscuit dates have second resolution) and stops at the first refusal.
+A certificate is derived from an `Authorization` only, which embeds the request it was granted for: principal `server:user`, `source-address` pinned to the client address (or to the bastion's, for relayed logins), `force-command` when requested. Its validity is never longer than what the token allows: the verifier evaluates the token at every second of the certificate lifetime (Biscuit dates have second resolution) and stops at the first refusal. The bastion applies the same rule to live connections, one lease after another.
+
+### Bastion invariants
+
+- Requests from the client are handled in russh handler callbacks that wait for the target's answer before replying: russh keeps a single pending-reply flag per channel.
+- Every wait in a callback or relay task is cancellable by the cut (`access::until_cut`); a cut closes the client and target sockets themselves after a short graceful window, since russh sessions run in background tasks that a stalled peer could keep alive.
+- russh uses `ssh-key` 0.7 while the CA uses 0.6: keys and certificates cross over in OpenSSH text format, in `target.rs` only.
 
 ## Constraints
 

@@ -9,6 +9,12 @@
 # files list `E2E_SERVER:<account>`. E2E_ADMIN is an SSH destination with sudo
 # on the server, used to edit the revocation list (restored on exit) and read
 # sshd logs.
+#
+# With E2E_BASTION (host:port), the bastion is tested too: it must relay
+# E2E_BASTION_SERVER, a server it alone can reach at E2E_BASTION_TARGET
+# (host:port, checked unreachable from here), where the same two accounts
+# accept the principals `E2E_BASTION_SERVER:<account>`. Its
+# session_check_interval must be at most 10 seconds.
 set -uo pipefail
 die() { echo "setup failed: $*" >&2; exit 1; }
 
@@ -161,6 +167,95 @@ fi
 
 expect_fail "plain http refused by client" "https" \
     "$B" login "$E2E_SERVER" "$E2E_USER" -i id_test -t token --issuer "http://$E2E_HOST:8443"
+
+if [[ -n ${E2E_BASTION:-} ]]; then
+    : "${E2E_BASTION_SERVER:?server name relayed by the bastion}"
+    : "${E2E_BASTION_TARGET:?address of that server, unreachable from here}"
+    via() {
+        local token=$1 login=$2; shift 2
+        "$B" ssh --bastion "$E2E_BASTION" -i id_test -t "$token" "$login" \
+            -o UserKnownHostsFile="$WORK/known_hosts" -o StrictHostKeyChecking=accept-new "$@" </dev/null
+    }
+    target_host=${E2E_BASTION_TARGET%:*} target_port=${E2E_BASTION_TARGET##*:}
+    if nc -z -w 3 "$target_host" "$target_port" 2>/dev/null; then
+        ko "bastion: target reachable directly"
+    else
+        ok "bastion: target not reachable directly"
+    fi
+
+    mint -r "$E2E_BASTION_SERVER:$E2E_USER" --ttl 1h >btoken
+    login_ok="$E2E_USER@$E2E_BASTION_SERVER"
+    expect_ok "bastion: exec" via btoken "$login_ok" true
+    out=$(via btoken "$login_ok" 'echo out; echo err >&2; exit 42' 2>"$WORK/stderr")
+    status=$?
+    if [[ $out == out && $(<"$WORK/stderr") == err && $status == 42 ]]; then
+        ok "bastion: stdout, stderr and exit status relayed"
+    else
+        ko "bastion: out=$out err=$(<"$WORK/stderr") status=$status"
+    fi
+    out=$(printf 'half-closed' | "$B" ssh --bastion "$E2E_BASTION" -i id_test -t btoken "$login_ok" \
+        -o UserKnownHostsFile="$WORK/known_hosts" 'cat; echo " after eof"' 2>&1)
+    if [[ $out == "half-closed after eof" ]]; then ok "bastion: stdin eof relayed"; else ko "bastion: stdin eof: $out"; fi
+    via btoken "$login_ok" -tt 'tty >/dev/null && exit 7' >/dev/null 2>&1
+    status=$?
+    if ((status == 7)); then ok "bastion: terminal session"; else ko "bastion: terminal session exited $status"; fi
+
+    # Plain ssh and sftp work too, with biscuit-ssh as askpass. Not `sftp -b`,
+    # which implies BatchMode and thus no keyboard-interactive.
+    askpass=(env SSH_ASKPASS="$B" SSH_ASKPASS_REQUIRE=force BISCUIT_SSH_ASKPASS_TOKEN="$(<btoken)")
+    bastion_opts=(-o IdentitiesOnly=yes -o UserKnownHostsFile="$WORK/known_hosts" -o User="$login_ok")
+    head -c 5000000 /dev/urandom >big
+    printf 'put big big.up\nget big.up big.down\nrm big.up\n' >batch
+    if "${askpass[@]}" sftp -q -P "${E2E_BASTION##*:}" -i id_test "${bastion_opts[@]}" "${E2E_BASTION%:*}" \
+        <batch >/dev/null 2>&1 && cmp -s big big.down; then
+        ok "bastion: sftp transfer of 5 MB, identical"
+    else
+        ko "bastion: sftp transfer"
+    fi
+    expect_fail "bastion: port forwarding refused" "failed" via btoken "$login_ok" -W 127.0.0.1:22
+
+    mint -r "unknown-server:$E2E_USER" >t_unknown
+    expect_fail "bastion: unknown server refused" "Permission denied" via t_unknown "$E2E_USER@unknown-server" true
+    attenuate -t btoken --public-key other_key.pub >t_key
+    expect_fail "bastion: token bound to another key refused" "Permission denied" via t_key "$login_ok" true
+    expect_fail "bastion: another account refused" "Permission denied" via btoken "$E2E_OTHER_USER@$E2E_BASTION_SERVER" true
+    attenuate -t btoken --command uptime >t_cmd
+    expect_fail "bastion: command-restricted token refused" "Permission denied" via t_cmd "$login_ok" uptime
+    expect_fail "bastion: token without key refused" "Permission denied" \
+        "${askpass[@]}" ssh -p "${E2E_BASTION##*:}" -o PubkeyAuthentication=no "${bastion_opts[@]}" \
+        "${E2E_BASTION%:*}" true
+
+    # Two channels on one connection: closing one keeps the other; expiry cuts both.
+    mint -r "$E2E_BASTION_SERVER:$E2E_USER" --ttl 25s >t_mux
+    expiry=$(($(date +%s) + 25))
+    via t_mux "$login_ok" -M -S "$WORK/mux" -f -N
+    ssh -S "$WORK/mux" -o UserKnownHostsFile="$WORK/known_hosts" x 'sleep 120' >/dev/null 2>&1 &
+    long=$!
+    sleep 2
+    out=$(ssh -S "$WORK/mux" -o UserKnownHostsFile="$WORK/known_hosts" x 'echo second' 2>&1)
+    if [[ $out == second ]] && kill -0 "$long" 2>/dev/null; then
+        ok "bastion: second channel alongside the first"
+    else
+        ko "bastion: multiplexing: $out"
+    fi
+    wait "$long"
+    ended=$(($(date +%s) - expiry))
+    if ((ended >= 0 && ended <= 2)); then ok "bastion: expiry cuts every channel (${ended}s)"; else ko "bastion: cut ${ended}s after expiry"; fi
+    ssh -S "$WORK/mux" -O exit x >/dev/null 2>&1
+    left=$(ssh -o BatchMode=yes "$E2E_ADMIN" "pgrep -u $E2E_USER -f 'sleep 120' || true")
+    if [[ -z $left ]]; then ok "bastion: nothing left running on the target"; else ko "bastion: processes left: $left"; fi
+
+    mint -r "$E2E_BASTION_SERVER:$E2E_USER" --ttl 1h >t_rev
+    id=$(revoked_id t_rev 0) || die "revocation id"
+    (sleep 3 && revoke "$id") &
+    start=$(date +%s)
+    via t_rev "$login_ok" 'sleep 60' >/dev/null 2>&1
+    wait
+    ended=$(($(date +%s) - start - 3))
+    if ((ended <= 11)); then ok "bastion: revocation cuts the session (${ended}s)"; else ko "bastion: revocation cut after ${ended}s"; fi
+    revoke ""
+    expect_fail "bastion: expired token refused" "Permission denied" via t_mux "$login_ok" true
+fi
 
 echo "---- $pass passed, $fail failed"
 ((fail == 0))

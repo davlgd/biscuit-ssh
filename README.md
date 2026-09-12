@@ -2,7 +2,10 @@
 
 SSH access for third parties through [Biscuit](https://www.biscuitsec.org/) tokens.
 
-A token grants logins (`server:account`) and can be restricted by anyone holding it, offline: expiration, source networks, servers, accounts, forced commands, SSH keys. The holder exchanges it for a short-lived OpenSSH certificate, and `sshd` enforces the rest. Servers run a stock OpenSSH that only trusts the certificate authority: nothing Biscuit-specific is installed on them.
+A token grants logins (`server:account`) and can be restricted by anyone holding it, offline: expiration, source networks, servers, accounts, forced commands, SSH keys. Servers run a stock OpenSSH that only trusts the certificate authority: nothing Biscuit-specific is installed on them. There are two ways in:
+
+- **Certificates**: the holder exchanges the token for a short-lived OpenSSH certificate, and `sshd` enforces the rest.
+- **Bastion**: the holder logs in to the bastion with the token, which relays the session to servers only it can reach, and cuts it as soon as the token stops allowing it.
 
 ```
 holder ── token + SSH public key ──▶ issuer: checks the token for this request
@@ -27,7 +30,7 @@ Only `permit-pty` is granted: no agent, port or X11 forwarding.
 cargo build --release
 ```
 
-This builds `biscuit-ssh-issuer` (the service) and `biscuit-ssh` (the client and admin tool).
+This builds `biscuit-ssh-issuer` and `biscuit-ssh-bastion` (the services) and `biscuit-ssh` (the client and admin tool).
 
 ## Deploy
 
@@ -85,6 +88,27 @@ AuthorizedPrincipalsFile /etc/ssh/principals/%u
 
 Keep server clocks synchronized: a lagging clock extends certificate validity.
 
+### Bastion
+
+`/etc/biscuit-ssh/bastion.toml`:
+
+```toml
+listen = "0.0.0.0:2200"
+host_key = "/etc/biscuit-ssh/bastion_host_key"   # ssh-keygen -t ed25519 -f bastion_host_key
+root_public_key = "ed25519/..."
+ca_key = "/etc/biscuit-ssh/ca"
+revocation_list = "/etc/biscuit-ssh/revoked"
+
+# Servers reachable through the bastion, by the name tokens use.
+[targets.web-1]
+address = "10.0.0.5:22"
+host_key = "ssh-ed25519 AAAA..."   # the server's host public key, required
+```
+
+Optional settings: `session_check_interval = 30` (seconds between token re-evaluations, 5 to 600; a revocation cuts sessions within that time), `clock_skew`, `policy`, and per target `source_address`, the bastion's address as the server sees it when network address translation hides the local one. Run it like the issuer, with its own systemd unit.
+
+Target servers are configured as in [Servers](#servers), the bastion logging in with certificates for the same principals, pinned to its own address: firewall them so that only the bastion reaches their `sshd`.
+
 ## Use
 
 The administrator grants access:
@@ -111,6 +135,14 @@ biscuit-ssh ssh -t contractor.token --server web-1 deploy@web-1.example.com
 
 `ssh` gets a certificate and runs `ssh` with it; what follows the destination goes to `ssh` unchanged, as with `ssh` itself, e.g. `deploy@web-1.example.com -p 2222 uptime`. `--server` is the server name in the token, the destination host by default. `ssh` is kept on the address family the issuer saw, since the certificate only accepts that address. The `ssh` subcommand currently requires a UTF-8 identity path without quotes or backslashes.
 
+Through the bastion, the destination is `account@server`, with the server named as in the token:
+
+```sh
+biscuit-ssh ssh --bastion bastion.example.com:2200 -t contractor.token deploy@web-1
+```
+
+`biscuit-ssh` runs `ssh` with itself as `SSH_ASKPASS`, answering the bastion's token prompt, and only that one: key passphrases and host key confirmations are still asked on the terminal. Plain `ssh`, `scp` or `sftp` work the same way with `SSH_ASKPASS=biscuit-ssh SSH_ASKPASS_REQUIRE=force BISCUIT_SSH_ASKPASS_TOKEN=<token>`, as long as `BatchMode` is off (it disables keyboard-interactive, hence `sftp -b`). Tokens restricted to commands are refused by the bastion for now.
+
 `login` only gets the certificate, for use with plain `ssh` or other tools within its lifetime:
 
 ```sh
@@ -135,7 +167,7 @@ Add a block's revocation identifier (from `token inspect`, also the certificate 
 ## Security notes
 
 - A certificate never outlives what its token allows: the token is evaluated at every second of the certificate lifetime, and validity stops at the first refusal.
-- `sshd` checks certificates when a session starts: expiration does not close sessions already open.
+- `sshd` checks certificates when a session starts: expiration does not close sessions already open. The bastion does close them, at the second the token stops allowing access (or within `session_check_interval` of a revocation), and hangs up their commands; processes that detach themselves (`nohup`, `setsid`) survive, as with any SSH disconnection.
 - The certificate is pinned to the client address the issuer sees, so `sshd` must see the same one: logging in through a jump host, a different NAT or another address family than the one used to reach the issuer is refused.
 - The issuer refuses to certify certificates, DSA keys or anything but plain OpenSSH public keys, and fails closed on any error, including an unreadable revocation list.
 
