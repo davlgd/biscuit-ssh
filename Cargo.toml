@@ -31,3 +31,6 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.4.2", features = ["json"] }
+bytes = "1.12.1"
+# SSH server and client of the bastion, on ring like the rest of the workspace.
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
