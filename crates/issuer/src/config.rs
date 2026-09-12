@@ -28,14 +28,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
-use biscuit_ssh_ca::CertificateAuthority;
-use biscuit_ssh_core::{DEFAULT_POLICY, MAX_LIFETIME, PublicKey, Verifier};
+use biscuit_ssh_core::MAX_LIFETIME;
+use biscuit_ssh_service::{Authority, AuthoritySettings, DEFAULT_CLOCK_SKEW, default_policy};
 use serde::Deserialize;
 
 use crate::issue::Issuer;
-
-/// Longest accepted `clock_skew`.
-const MAX_CLOCK_SKEW: Duration = Duration::from_secs(300);
 
 /// Issuer configuration, see the module documentation.
 #[derive(Debug, Deserialize)]
@@ -74,11 +71,7 @@ fn default_lifetime() -> u64 {
 }
 
 fn default_clock_skew() -> u64 {
-    30
-}
-
-fn default_policy() -> String {
-    DEFAULT_POLICY.to_owned()
+    DEFAULT_CLOCK_SKEW
 }
 
 impl Config {
@@ -96,20 +89,14 @@ impl Config {
             "certificate_lifetime must be between 1 and {} seconds",
             MAX_LIFETIME.as_secs()
         );
-        let clock_skew = Duration::from_secs(self.clock_skew);
-        ensure!(
-            clock_skew <= MAX_CLOCK_SKEW,
-            "clock_skew must be at most {} seconds",
-            MAX_CLOCK_SKEW.as_secs()
-        );
-        let root_key: PublicKey = self.root_public_key.parse().context("invalid root_public_key")?;
-        Ok(Issuer {
-            verifier: Verifier::new(root_key, &self.policy).context("invalid policy")?,
-            ca: CertificateAuthority::load(&self.ca_key)?,
-            revocation_list: self.revocation_list.clone(),
-            lifetime,
-            clock_skew,
-        })
+        let authority = Authority::load(&AuthoritySettings {
+            root_public_key: &self.root_public_key,
+            ca_key: &self.ca_key,
+            revocation_list: self.revocation_list.as_deref(),
+            policy: &self.policy,
+            clock_skew: self.clock_skew,
+        })?;
+        Ok(Issuer { authority, lifetime })
     }
 }
 
@@ -129,7 +116,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.certificate_lifetime, 120);
         assert_eq!(config.clock_skew, 30);
-        assert_eq!(config.policy, DEFAULT_POLICY);
+        assert_eq!(config.policy, default_policy());
         assert!(config.tls.is_none() && config.trusted_proxies.is_empty());
     }
 

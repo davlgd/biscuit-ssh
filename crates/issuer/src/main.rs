@@ -9,7 +9,6 @@ mod config;
 mod http;
 mod issue;
 
-use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +17,6 @@ use anyhow::Context;
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 
@@ -35,11 +33,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        // No color codes in journald or log files.
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+    biscuit_ssh_service::init_tracing();
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
@@ -73,23 +67,6 @@ async fn main() -> anyhow::Result<()> {
 
 /// Stops accepting connections on SIGINT or SIGTERM.
 async fn shutdown_on_signal(handle: Handle<SocketAddr>) {
-    let interrupt = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(_) => std::future::pending().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = interrupt => {}
-        _ = terminate => {}
-    }
-    tracing::info!("shutting down");
+    biscuit_ssh_service::shutdown_signal().await;
     handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
 }

@@ -66,6 +66,7 @@ async fn certificates(
 async fn ca(State(state): State<Arc<AppState>>) -> Result<String, IssueError> {
     state
         .issuer
+        .authority
         .ca
         .public_key()
         .to_openssh()
@@ -73,7 +74,7 @@ async fn ca(State(state): State<Arc<AppState>>) -> Result<String, IssueError> {
 }
 
 async fn root_key(State(state): State<Arc<AppState>>) -> String {
-    state.issuer.verifier.root_key().to_string()
+    state.issuer.authority.verifier.root_key().to_string()
 }
 
 /// The address certificates are bound to.

@@ -1,12 +1,13 @@
 //! Certificate issuance, independent of the HTTP layer.
 
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use biscuit_ssh_ca::{CertificateAuthority, fingerprint, parse_public_key};
+use biscuit_ssh_ca::{fingerprint, parse_public_key};
+use biscuit_ssh_core::AccessRequest;
+use biscuit_ssh_core::Mode;
 use biscuit_ssh_core::api::{CertificateRequest, CertificateResponse};
-use biscuit_ssh_core::{AccessRequest, Mode, RevocationList, Verifier};
+use biscuit_ssh_service::Authority;
 
 /// Why a certificate was not issued. Carries no token content.
 #[derive(Debug, thiserror::Error)]
@@ -34,12 +35,8 @@ pub enum IssueError {
 
 /// Everything needed to turn tokens into certificates.
 pub struct Issuer {
-    pub(crate) verifier: Verifier,
-    pub(crate) ca: CertificateAuthority,
-    /// Re-read on every request so revocations apply immediately.
-    pub(crate) revocation_list: Option<PathBuf>,
+    pub(crate) authority: Authority,
     pub(crate) lifetime: Duration,
-    pub(crate) clock_skew: Duration,
 }
 
 impl Issuer {
@@ -91,8 +88,9 @@ impl Issuer {
             .record("user", request.user.as_str())
             .record("key", &request.public_key);
 
-        let revoked = self.revocations()?;
+        let revoked = self.authority.revocations().map_err(|_| IssueError::Internal)?;
         let authorization = self
+            .authority
             .verifier
             .authorize(&body.token, &request, &revoked, self.lifetime)
             .map_err(|e| match e {
@@ -108,8 +106,9 @@ impl Issuer {
                 },
             })?;
         let certificate = self
+            .authority
             .ca
-            .sign(&key, &authorization, self.clock_skew)
+            .sign(&key, &authorization, self.authority.clock_skew)
             .and_then(|c| Ok(c.to_openssh()?))
             .map_err(|e| {
                 tracing::error!(error = %e, "signing failure");
@@ -128,25 +127,14 @@ impl Issuer {
             valid_before,
         })
     }
-
-    fn revocations(&self) -> Result<RevocationList, IssueError> {
-        let Some(path) = &self.revocation_list else {
-            return Ok(RevocationList::default());
-        };
-        std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| RevocationList::parse(&text).map_err(|e| e.to_string()))
-            .map_err(|e| {
-                // Fail closed: an unreadable list could hide a revocation.
-                tracing::error!(path = %path.display(), error = %e, "cannot read revocation list");
-                IssueError::Internal
-            })
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use biscuit_ssh_core::{DEFAULT_POLICY, KeyPair, Restriction, mint};
+    use std::path::PathBuf;
+
+    use biscuit_ssh_ca::CertificateAuthority;
+    use biscuit_ssh_core::{DEFAULT_POLICY, KeyPair, Restriction, Verifier, mint};
     use ssh_key::rand_core::OsRng;
     use ssh_key::{Algorithm, Certificate, PrivateKey};
 
@@ -164,11 +152,13 @@ mod tests {
         let user_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         Setup {
             issuer: Issuer {
-                verifier: Verifier::new(root.public(), DEFAULT_POLICY).unwrap(),
-                ca: CertificateAuthority::new(ca_key).unwrap(),
-                revocation_list,
+                authority: Authority::new(
+                    Verifier::new(root.public(), DEFAULT_POLICY).unwrap(),
+                    CertificateAuthority::new(ca_key).unwrap(),
+                    revocation_list,
+                    Duration::from_secs(30),
+                ),
                 lifetime: Duration::from_secs(120),
-                clock_skew: Duration::from_secs(30),
             },
             root,
             user_key: user_key.public_key().to_openssh().unwrap(),

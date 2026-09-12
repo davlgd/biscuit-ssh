@@ -288,6 +288,7 @@ dependencies = [
  "axum-server",
  "biscuit-ssh-ca",
  "biscuit-ssh-core",
+ "biscuit-ssh-service",
  "clap",
  "rustls",
  "serde",
@@ -296,6 +297,17 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "biscuit-ssh-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "biscuit-ssh-ca",
+ "biscuit-ssh-core",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

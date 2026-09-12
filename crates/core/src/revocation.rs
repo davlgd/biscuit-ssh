@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use crate::Error;
 
@@ -34,6 +35,12 @@ impl RevocationList {
             })
             .collect::<Result<_, _>>()
             .map(Self)
+    }
+
+    /// Reads and parses the file at `path`.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        Self::parse(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// The first of `ids` that is revoked, if any.
