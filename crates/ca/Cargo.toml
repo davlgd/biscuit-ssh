@@ -1,0 +1,13 @@
+[package]
+name = "biscuit-ssh-ca"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+biscuit-ssh-core.workspace = true
+ssh-key.workspace = true
+thiserror.workspace = true
