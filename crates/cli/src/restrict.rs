@@ -17,13 +17,14 @@ pub struct Restrictions {
     /// Only from this network, e.g. 192.0.2.0/24, 2001:db8::/32 or a single address.
     #[arg(long = "source", value_name = "NETWORK")]
     sources: Vec<Network>,
-    /// Only to this server.
+    /// Only to this server, named as in the token's rights.
     #[arg(long = "server", value_name = "NAME")]
     servers: Vec<Name>,
     /// Only as this account.
     #[arg(long = "user", value_name = "NAME")]
     users: Vec<Name>,
-    /// Only with this forced command (interactive sessions are then refused).
+    /// Only with this forced command (interactive sessions are then refused;
+    /// the bastion refuses such tokens for now).
     #[arg(long = "command", value_name = "COMMAND")]
     commands: Vec<Command>,
     /// Only with this SSH key: a SHA256 fingerprint or a public key file.
@@ -36,7 +37,9 @@ pub struct Restrictions {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum ModeArg {
+    /// With certificates from the issuer.
     Certificate,
+    /// Through the bastion.
     Bastion,
 }
 

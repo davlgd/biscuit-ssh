@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use biscuit_ssh_core::{MAX_LIFETIME, Name};
-use biscuit_ssh_service::{Authority, AuthoritySettings, DEFAULT_CLOCK_SKEW, default_policy};
+use biscuit_ssh_service::{Authority, AuthoritySettings, default_clock_skew, default_policy};
 use russh::keys::{PrivateKey, PublicKey};
 use serde::Deserialize;
 
@@ -89,10 +89,6 @@ pub struct Settings {
 
 fn default_check_interval() -> u64 {
     30
-}
-
-fn default_clock_skew() -> u64 {
-    DEFAULT_CLOCK_SKEW
 }
 
 impl Config {

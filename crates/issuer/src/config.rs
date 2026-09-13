@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use biscuit_ssh_core::MAX_LIFETIME;
-use biscuit_ssh_service::{Authority, AuthoritySettings, DEFAULT_CLOCK_SKEW, default_policy};
+use biscuit_ssh_service::{Authority, AuthoritySettings, default_clock_skew, default_policy};
 use serde::Deserialize;
 
 use crate::issue::Issuer;
@@ -68,10 +68,6 @@ pub struct Tls {
 
 fn default_lifetime() -> u64 {
     120
-}
-
-fn default_clock_skew() -> u64 {
-    DEFAULT_CLOCK_SKEW
 }
 
 impl Config {

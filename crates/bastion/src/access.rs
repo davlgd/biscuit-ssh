@@ -35,61 +35,49 @@ pub struct Grant {
 /// Why a token check failed.
 #[derive(Debug)]
 pub enum Refusal {
-    /// The token does not allow the request (at the requested time).
-    Denied(biscuit_ssh_core::Error),
+    /// The token does not allow the request at the requested time: the
+    /// connection may go on until then.
+    Denied,
     /// Revoked, invalid, or the revocation list is unreadable: stop at once.
-    Revoked(&'static str),
+    Immediate(&'static str),
 }
 
 impl Refusal {
     /// A stable, content-free label for logs.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Denied(e) => e.kind(),
-            Self::Revoked(kind) => kind,
+            Self::Denied => "denied",
+            Self::Immediate(kind) => kind,
         }
     }
 }
 
 impl Grant {
-    /// Evaluates the token for `lifetime` from `time`. Blocking: Datalog.
+    /// Evaluates the token for `lifetime` from `time`, against the current
+    /// revocation list. Blocking: Datalog.
     pub fn authorize(
         &self,
         settings: &Settings,
         time: SystemTime,
         lifetime: Duration,
     ) -> Result<Authorization, Refusal> {
-        authorize(
-            settings,
-            &self.token,
-            &AccessRequest {
-                time,
-                ..self.request.clone()
-            },
-            lifetime,
-        )
+        let revoked = settings
+            .authority
+            .revocations()
+            .map_err(|_| Refusal::Immediate("revocation_list_unreadable"))?;
+        let request = AccessRequest {
+            time,
+            ..self.request.clone()
+        };
+        settings
+            .authority
+            .verifier
+            .authorize(&self.token, &request, &revoked, lifetime)
+            .map_err(|e| match e {
+                biscuit_ssh_core::Error::Denied(_) => Refusal::Denied,
+                _ => Refusal::Immediate(e.kind()),
+            })
     }
-}
-
-/// Checks `token` against `request` and the current revocation list.
-pub fn authorize(
-    settings: &Settings,
-    token: &str,
-    request: &AccessRequest,
-    lifetime: Duration,
-) -> Result<Authorization, Refusal> {
-    let revoked = settings
-        .authority
-        .revocations()
-        .map_err(|_| Refusal::Revoked("revocation_list_unreadable"))?;
-    settings
-        .authority
-        .verifier
-        .authorize(token, request, &revoked, lifetime)
-        .map_err(|e| match e {
-            biscuit_ssh_core::Error::Denied(_) => Refusal::Denied(e),
-            _ => Refusal::Revoked(e.kind()),
-        })
 }
 
 /// Keeps renewing the lease of a connection until the token stops allowing
@@ -115,7 +103,7 @@ pub async fn guard(
         tokio::select! {
             result = renewal => match result {
                 Ok(Ok(authorization)) => lease_end = authorization.valid_until(),
-                Ok(Err(Refusal::Denied(_))) => {
+                Ok(Err(Refusal::Denied)) => {
                     // Still allowed until the lease ends, not a second more.
                     tokio::select! {
                         () = tokio::time::sleep_until(deadline) => {}

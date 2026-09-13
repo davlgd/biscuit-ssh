@@ -9,7 +9,6 @@ description.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-biscuit-ssh-ca.workspace = true
 biscuit-ssh-core.workspace = true
 biscuit-ssh-service.workspace = true
 bytes.workspace = true

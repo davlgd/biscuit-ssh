@@ -10,9 +10,8 @@ description.workspace = true
 [dependencies]
 anyhow.workspace = true
 biscuit-ssh-ca.workspace = true
-biscuit-ssh-core.workspace = true
+biscuit-ssh-core = { workspace = true, features = ["api"] }
 clap.workspace = true
-serde.workspace = true
 ureq.workspace = true
 ssh-key.workspace = true
 rpassword.workspace = true

@@ -14,9 +14,14 @@
 # E2E_BASTION_SERVER, a server it alone can reach at E2E_BASTION_TARGET
 # (host:port, checked unreachable from here), where the same two accounts
 # accept the principals `E2E_BASTION_SERVER:<account>`. Its
-# session_check_interval must be at most 10 seconds.
+# session_check_interval must be at most 10 seconds. The check that nothing
+# keeps running after a cut looks at processes on E2E_ADMIN, so it assumes
+# that host is the relayed server.
 set -uo pipefail
 die() { echo "setup failed: $*" >&2; exit 1; }
+for tool in cargo ssh sftp ssh-keygen nc cmp; do
+    command -v "$tool" >/dev/null || die "$tool is required"
+done
 
 : "${E2E_HOST:?address of the server}"
 : "${E2E_ADMIN:?SSH destination with sudo on the server}"
@@ -40,6 +45,8 @@ ssh -o BatchMode=yes "$E2E_ADMIN" "sudo cat $E2E_REVOKED" >"$WORK/revoked.orig" 
 remote=""
 restore() {
     local status=$?
+    jobs -p | xargs kill 2>/dev/null
+    [[ -S $WORK/mux ]] && ssh -S "$WORK/mux" -O exit x 2>/dev/null
     [[ -n $remote ]] && ssh -o BatchMode=yes "$E2E_ADMIN" "rm -rf '$remote'"
     if ssh -o BatchMode=yes "$E2E_ADMIN" "sudo tee $E2E_REVOKED >/dev/null" <"$WORK/revoked.orig"; then
         rm -rf "$WORK"
@@ -101,7 +108,7 @@ expect_fail "port forwarding: refused" "prohibited" ssh "${OPTS[@]}" -W 127.0.0.
 
 mint -r "other-server:$E2E_USER" >other_server
 expect_fail "right for another server: denied" "403.*denied" login -t other_server
-expect_fail "denial explained: no matching right" "grants no access" login -t other_server
+expect_fail "denial explained: rights granted listed" "grants other-server:$E2E_USER but not" login -t other_server
 expect_ok "certificate for another server: issued" \
     "$B" login other-server "$E2E_USER" -i id_test "${ISSUER_CA[@]}" -t other_server
 expect_fail "certificate for another server: sshd refuses principal" "Permission denied" "${SSH[@]}" true
@@ -205,7 +212,7 @@ if [[ -n ${E2E_BASTION:-} ]]; then
     askpass=(env SSH_ASKPASS="$B" SSH_ASKPASS_REQUIRE=force BISCUIT_SSH_ASKPASS_TOKEN="$(<btoken)")
     bastion_opts=(-o IdentitiesOnly=yes -o UserKnownHostsFile="$WORK/known_hosts" -o User="$login_ok")
     head -c 5000000 /dev/urandom >big
-    remote_file="biscuit-ssh-e2e-$$-$RANDOM"
+    remote_file="/tmp/biscuit-ssh-e2e-$$-$RANDOM"
     printf 'put big %s\nget %s big.down\nrm %s\n' "$remote_file" "$remote_file" "$remote_file" >batch
     if "${askpass[@]}" sftp -q -P "${E2E_BASTION##*:}" -i id_test "${bastion_opts[@]}" "${E2E_BASTION%:*}" \
         <batch >/dev/null 2>&1 && cmp -s big big.down; then
@@ -215,13 +222,22 @@ if [[ -n ${E2E_BASTION:-} ]]; then
     fi
     expect_fail "bastion: port forwarding refused" "failed" via btoken "$login_ok" -W 127.0.0.1:22
 
+    cp btoken t_long
+    for _ in 1 2 3 4 5; do attenuate -t t_long --server "$E2E_BASTION_SERVER" >t_next && mv t_next t_long; done
+    (($(wc -c <t_long) > 1100)) || die "attenuated token unexpectedly short"
+    expect_ok "bastion: token longer than an ssh answer ($(wc -c <t_long | tr -d ' ') bytes)" via t_long "$login_ok" true
+
     mint -r "unknown-server:$E2E_USER" >t_unknown
-    expect_fail "bastion: unknown server refused" "Permission denied" via t_unknown "$E2E_USER@unknown-server" true
+    expect_fail "bastion: unknown server refused, with a reason" "access refused (denied)" \
+        via t_unknown "$E2E_USER@unknown-server" true
+    expect_fail "bastion: malformed login refused, with a reason" "access refused (invalid_login)" \
+        via btoken "$E2E_USER@bad:name" true
     attenuate -t btoken --public-key other_key.pub >t_key
-    expect_fail "bastion: token bound to another key refused" "Permission denied" via t_key "$login_ok" true
-    expect_fail "bastion: another account refused" "Permission denied" via btoken "$E2E_OTHER_USER@$E2E_BASTION_SERVER" true
+    expect_fail "bastion: token bound to another key refused" "access refused (denied)" via t_key "$login_ok" true
+    expect_fail "bastion: another account refused" "access refused (denied)" \
+        via btoken "$E2E_OTHER_USER@$E2E_BASTION_SERVER" true
     attenuate -t btoken --command uptime >t_cmd
-    expect_fail "bastion: command-restricted token refused" "Permission denied" via t_cmd "$login_ok" uptime
+    expect_fail "bastion: command-restricted token refused" "access refused (denied)" via t_cmd "$login_ok" uptime
     expect_fail "bastion: token without key refused" "Permission denied" \
         "${askpass[@]}" ssh -p "${E2E_BASTION##*:}" -o PubkeyAuthentication=no "${bastion_opts[@]}" \
         "${E2E_BASTION%:*}" true
@@ -273,7 +289,7 @@ if [[ -n ${E2E_BASTION:-} ]]; then
         ko "bastion: revocation test session did not start: $(<session.out)"
     fi
     revoke ""
-    expect_fail "bastion: expired token refused" "Permission denied" via t_mux "$login_ok" true
+    expect_fail "bastion: expired token refused" "access refused (denied)" via t_mux "$login_ok" true
 fi
 
 echo "---- $pass passed, $fail failed"

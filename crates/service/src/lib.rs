@@ -13,8 +13,10 @@ use biscuit_ssh_ca::CertificateAuthority;
 use biscuit_ssh_core::{DEFAULT_POLICY, PublicKey, RevocationList, Verifier};
 use tracing_subscriber::EnvFilter;
 
-/// Default `clock_skew`, in seconds.
-pub const DEFAULT_CLOCK_SKEW: u64 = 30;
+/// The default `clock_skew`, in seconds, for configuration defaults.
+pub fn default_clock_skew() -> u64 {
+    30
+}
 
 /// Longest accepted `clock_skew`.
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(300);
@@ -108,6 +110,7 @@ pub fn default_policy() -> String {
 pub fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 }

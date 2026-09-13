@@ -40,7 +40,7 @@ enum TokenCommand {
     /// new token.
     Attenuate {
         /// Token file, `-` for standard input.
-        #[arg(short, long, default_value = "-")]
+        #[arg(short, long, value_name = "FILE", env = "BISCUIT_SSH_TOKEN_FILE")]
         token: PathBuf,
         #[command(flatten)]
         restrictions: Restrictions,
@@ -49,7 +49,7 @@ enum TokenCommand {
     /// verifying its signature.
     Inspect {
         /// Token file, `-` for standard input.
-        #[arg(short, long, default_value = "-")]
+        #[arg(short, long, value_name = "FILE", env = "BISCUIT_SSH_TOKEN_FILE")]
         token: PathBuf,
     },
 }

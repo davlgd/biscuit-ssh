@@ -11,11 +11,11 @@ repository = "https://github.com/davlgd/biscuit-ssh"
 description = "SSH access for third parties through Biscuit tokens"
 
 [workspace.dependencies]
-biscuit-ssh-core = { path = "crates/core", features = ["api"] }
+biscuit-ssh-core = { path = "crates/core" }
 biscuit-ssh-ca = { path = "crates/ca" }
 biscuit-ssh-service = { path = "crates/service" }
 # `datalog-macro` is unused but biscuit-auth 6.0.0 fails to build without it.
-biscuit-auth = { version = "6.0.0", default-features = false, features = ["datalog-macro", "pem"] }
+biscuit-auth = { version = "6.0.0", default-features = false, features = ["datalog-macro"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
 thiserror = "2.0.21"
 anyhow = "1.0.104"

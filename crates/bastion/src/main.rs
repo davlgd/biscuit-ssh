@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
         std::thread::available_parallelism().map_or(1, |n| n.get()),
     ));
     let listener = TcpListener::bind(config.listen).await?;
-    tracing::info!(listen = %config.listen, targets = settings.targets.len(), "listening");
+    // Clients verify it on first connection: operators hand it out.
+    let host_key = settings.host_key.public_key().fingerprint(russh::keys::HashAlg::Sha256);
+    tracing::info!(listen = %config.listen, targets = settings.targets.len(), %host_key, "listening");
 
     let shutdown = biscuit_ssh_service::shutdown_signal();
     tokio::pin!(shutdown);

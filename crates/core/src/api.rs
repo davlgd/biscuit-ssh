@@ -1,5 +1,4 @@
-//! Protocols between the services and the client: the issuer HTTP API, and
-//! the bastion's keyboard-interactive prompt ([`BASTION_TOKEN_PROMPT`]).
+//! Messages of the issuer HTTP API, shared by the issuer and the client.
 //!
 //! - `POST /v1/certificates`: [`CertificateRequest`] → [`CertificateResponse`],
 //!   or an [`ErrorResponse`] with status 400 (invalid field), 403 (token
@@ -11,10 +10,6 @@
 //!   text, so clients can explain refusals with [`failed_checks`](crate::failed_checks).
 
 use std::net::IpAddr;
-
-/// The keyboard-interactive prompt the bastion asks the token with. The
-/// client recognizes it to answer it, and nothing else, automatically.
-pub const BASTION_TOKEN_PROMPT: &str = "Biscuit token: ";
 
 use serde::{Deserialize, Serialize};
 

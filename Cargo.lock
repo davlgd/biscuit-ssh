@@ -332,7 +332,6 @@ dependencies = [
  "biscuit-ssh-core",
  "clap",
  "rpassword",
- "serde",
  "ssh-key 0.6.7",
  "ureq",
 ]
@@ -342,7 +341,6 @@ name = "biscuit-ssh-bastion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "biscuit-ssh-ca",
  "biscuit-ssh-core",
  "biscuit-ssh-service",
  "bytes",

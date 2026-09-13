@@ -34,7 +34,7 @@ use biscuit_auth::builder::{Check, Fact, Term, fact, string};
 use crate::{AccessRequest, Command, Error, Mode, Name, Network};
 
 /// Permission to log in as `user` on `server`, written `server:user`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Right {
     /// Server the right applies to.
     pub server: Name,

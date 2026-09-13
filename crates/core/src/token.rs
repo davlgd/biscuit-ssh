@@ -1,6 +1,6 @@
 //! Creating, restricting and inspecting tokens.
 
-use biscuit_auth::{Biscuit, BlockBuilder, KeyPair, UnverifiedBiscuit};
+use biscuit_auth::{AuthorizerBuilder, Biscuit, BlockBuilder, KeyPair, PublicKey, UnverifiedBiscuit};
 
 use crate::revocation::hex;
 use crate::{Error, Restriction, Right};
@@ -44,6 +44,27 @@ pub fn attenuate(token: &str, restrictions: &[Restriction]) -> Result<String, Er
         .append(block)
         .and_then(|token| token.to_base64())
         .map_err(Error::Datalog)
+}
+
+/// The rights granted by the authority block of `token`, sorted, once its
+/// signature is checked against `root_key`. Restrictions are not evaluated.
+pub fn granted_rights(root_key: PublicKey, token: &str) -> Result<Vec<Right>, Error> {
+    let token = Biscuit::from_base64(token.trim(), root_key).map_err(Error::InvalidToken)?;
+    let mut authorizer = AuthorizerBuilder::new().build(&token).map_err(Error::Datalog)?;
+    let rights: Vec<(String, String)> = authorizer
+        .query("granted($s, $u) <- right($s, $u)")
+        .map_err(Error::Datalog)?;
+    let mut rights = rights
+        .into_iter()
+        .map(|(server, user)| {
+            Ok(Right {
+                server: server.parse()?,
+                user: user.parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    rights.sort();
+    Ok(rights)
 }
 
 /// One block of a token, as shown to humans.

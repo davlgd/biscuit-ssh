@@ -2,8 +2,8 @@
 //!
 //! Clients log in as `user@server`, where `server` names a configured
 //! target. Authentication takes two steps: a public key (its fingerprint is
-//! the `public_key` fact), then the token through keyboard-interactive,
-//! answering the [`BASTION_TOKEN_PROMPT`] prompt.
+//! the `public_key` fact), then the token through keyboard-interactive, in
+//! parts (see [`bastion_login`]).
 //!
 //! Only session channels are relayed (shell, exec, subsystems such as sftp,
 //! with terminal and signal handling). Port, agent and X11 forwarding,
@@ -15,8 +15,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, anyhow};
-use biscuit_ssh_core::api::BASTION_TOKEN_PROMPT;
+use anyhow::{Context, anyhow, bail};
+use biscuit_ssh_core::bastion_login;
 use biscuit_ssh_core::{AccessRequest, Mode, Name};
 use bytes::Bytes;
 use russh::keys::{HashAlg, PublicKey};
@@ -30,8 +30,46 @@ use crate::config::Settings;
 use crate::relay::{self, Relay, Replies};
 use crate::target::{self, TargetConnection};
 
+/// Asks for one part of the token.
+fn ask_token_part(part: usize) -> Auth {
+    Auth::Partial {
+        name: Cow::Borrowed(""),
+        instructions: Cow::Borrowed(""),
+        prompts: Cow::Owned(vec![(Cow::Owned(bastion_login::prompt(part)), false)]),
+    }
+}
+
 /// How long a forwarded request may wait for the target's answer.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a login was refused: `kind` is told to the client, `detail` logged.
+struct Refused {
+    kind: &'static str,
+    detail: anyhow::Error,
+}
+
+impl Refused {
+    fn new(kind: &'static str, detail: anyhow::Error) -> Self {
+        Self { kind, detail }
+    }
+
+    /// What the client is told: the kind of refusal and what it usually
+    /// means, never token content or configuration details.
+    fn explanation(&self, peer: IpAddr) -> String {
+        let meaning = match self.kind {
+            "invalid_login" => "log in as user@server, with the server named as in the token",
+            "denied" => "the token does not allow this login (server, account, restrictions or expiry)",
+            "revoked" => "the token has been revoked",
+            "invalid_token" => "the token is malformed or not issued for this bastion",
+            "busy" => "the bastion is busy, retry later",
+            _ => "internal error",
+        };
+        format!(
+            "biscuit-ssh bastion: access refused ({}) for {peer}: {meaning}",
+            self.kind
+        )
+    }
+}
 
 /// One client connection.
 pub struct Connection {
@@ -43,6 +81,11 @@ pub struct Connection {
     span: tracing::Span,
     /// Login name and fingerprint of the key the client proved it holds.
     verified_key: Option<(String, String)>,
+    /// Parts of the token received so far.
+    token_parts: Vec<String>,
+    /// Set when the token was refused: the client has been told why, and
+    /// the connection ends on its next answer.
+    refused: bool,
     /// Set once the token is accepted, with the end of the first lease.
     grant: Option<(Arc<Grant>, u64)>,
     cutter: Arc<Cutter>,
@@ -74,6 +117,8 @@ impl Connection {
             peer,
             span: tracing::info_span!("client", %peer, server = tracing::field::Empty),
             verified_key: None,
+            token_parts: Vec::new(),
+            refused: false,
             grant: None,
             cut: cutter.watch(),
             cutter,
@@ -83,14 +128,17 @@ impl Connection {
     }
 
     /// Checks the token presented by the client for `login`.
-    async fn authenticate(&mut self, login: &str, fingerprint: String, token: String) -> anyhow::Result<()> {
-        let (user, server) = login.rsplit_once('@').context("the login must be user@server")?;
-        let (user, server): (Name, Name) = (user.parse()?, server.parse()?);
+    async fn authenticate(&mut self, login: &str, fingerprint: String, token: String) -> Result<(), Refused> {
+        let (user, server) = login
+            .rsplit_once('@')
+            .and_then(|(user, server)| Some((user.parse::<Name>().ok()?, server.parse::<Name>().ok()?)))
+            .ok_or(Refused::new("invalid_login", anyhow!("invalid login")))?;
+        // Reported as a mere denial, so clients cannot enumerate targets.
         let target = self
             .settings
             .targets
             .get(&server)
-            .with_context(|| format!("unknown server {server}"))?
+            .ok_or_else(|| Refused::new("denied", anyhow!("unknown server {server}")))?
             .clone();
         let request = AccessRequest {
             time: SystemTime::now(),
@@ -105,14 +153,15 @@ impl Connection {
 
         let permit = Arc::clone(&self.admission)
             .try_acquire_owned()
-            .map_err(|_| anyhow!("busy"))?;
+            .map_err(|_| Refused::new("busy", anyhow!("too many logins")))?;
         let (settings, checked) = (Arc::clone(&self.settings), Arc::clone(&grant));
         let authorization = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            access::authorize(&settings, &checked.token, &checked.request, settings.check_interval)
+            checked.authorize(&settings, checked.request.time, settings.check_interval)
         })
-        .await?
-        .map_err(|refusal| anyhow!("token refused: {}", refusal.kind()))?;
+        .await
+        .map_err(|e| Refused::new("internal", e.into()))?
+        .map_err(|refusal| Refused::new(refusal.kind(), anyhow!("token refused")))?;
 
         self.span.record("server", grant.request.server.as_str());
         tracing::info!(
@@ -124,6 +173,19 @@ impl Connection {
         );
         self.grant = Some((grant, authorization.valid_until()));
         Ok(())
+    }
+
+    /// Logs a refused login and tells the client why. SSH has no refusal
+    /// message: an extra round without prompts shows the reason, and the
+    /// connection ends on the client's answer.
+    fn refuse(&mut self, refused: Refused) -> Auth {
+        tracing::warn!(parent: &self.span, kind = refused.kind, error = %refused.detail, "authentication refused");
+        self.refused = true;
+        Auth::Partial {
+            name: Cow::Borrowed(""),
+            instructions: Cow::Owned(refused.explanation(self.peer)),
+            prompts: Cow::Owned(Vec::new()),
+        }
     }
 
     /// Opens the target side of a new session channel, connecting to the
@@ -235,23 +297,32 @@ impl russh::server::Handler for Connection {
         else {
             return Ok(Auth::reject());
         };
+        if self.refused {
+            // Told why on the previous round: end the connection rather than
+            // let the client try again and again.
+            bail!("login refused");
+        }
         let Some(mut response) = response else {
-            return Ok(Auth::Partial {
-                name: Cow::Borrowed(""),
-                instructions: Cow::Borrowed(""),
-                prompts: Cow::Owned(vec![(Cow::Borrowed(BASTION_TOKEN_PROMPT), false)]),
-            });
+            self.token_parts.clear();
+            return Ok(ask_token_part(1));
         };
-        let token = response
+        let answer = response
             .next()
             .map(|t| String::from_utf8_lossy(&t).into_owned())
             .unwrap_or_default();
+        // The token comes in parts, see `bastion_login`.
+        if let Some(part) = answer.strip_suffix(bastion_login::MORE) {
+            self.token_parts.push(part.to_owned());
+            if self.token_parts.len() >= bastion_login::MAX_PARTS {
+                let refused = Refused::new("invalid_token", anyhow!("token too long"));
+                return Ok(self.refuse(refused));
+            }
+            return Ok(ask_token_part(self.token_parts.len() + 1));
+        }
+        let token = std::mem::take(&mut self.token_parts).concat() + &answer;
         match self.authenticate(login, fingerprint, token).await {
             Ok(()) => Ok(Auth::Accept),
-            Err(error) => {
-                tracing::warn!(parent: &self.span, error = %error, "authentication refused");
-                Ok(Auth::reject())
-            }
+            Err(refused) => Ok(self.refuse(refused)),
         }
     }
 

@@ -15,18 +15,19 @@ use crate::login::{Login, Options, login};
 pub struct Args {
     /// Where to connect, as `user@host`.
     destination: String,
-    /// Server name in the token [default: the host of DESTINATION].
+    /// Server name in the token, when it differs from the host of
+    /// DESTINATION, e.g. when connecting by address [default: that host].
     #[arg(long)]
     server: Option<String>,
     /// Connect through this bastion, `host` or `host:port`, instead of
     /// getting a certificate: DESTINATION is then `user@server`, with the
     /// server named as in the token.
-    #[arg(long, value_name = "HOST[:PORT]", conflicts_with = "server")]
+    #[arg(long, value_name = "HOST[:PORT]", conflicts_with_all = ["server", "command"])]
     bastion: Option<String>,
     #[command(flatten)]
     options: Options,
-    /// Passed to `ssh` after the destination, as with `ssh` itself: options,
-    /// then a remote command.
+    /// Passed to `ssh` after the destination, as with `ssh` itself: options
+    /// (there, `-t` is ssh's own), then a remote command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "SSH_ARGS")]
     ssh_args: Vec<String>,
 }

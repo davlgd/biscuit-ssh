@@ -11,6 +11,7 @@
 
 #[cfg(feature = "api")]
 pub mod api;
+pub mod bastion_login;
 mod error;
 mod net;
 mod request;
@@ -24,6 +25,6 @@ pub use error::Error;
 pub use net::Network;
 pub use request::{AccessRequest, Command, Mode, Name};
 pub use revocation::RevocationList;
-pub use token::{BlockInfo, attenuate, inspect, mint};
+pub use token::{BlockInfo, attenuate, granted_rights, inspect, mint};
 pub use verifier::{Authorization, DEFAULT_POLICY, MAX_LIFETIME, MAX_TOKEN_LEN, Verifier, failed_checks};
 pub use vocabulary::{Restriction, Right};

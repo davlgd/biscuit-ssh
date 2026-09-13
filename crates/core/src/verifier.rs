@@ -254,6 +254,20 @@ mod tests {
     }
 
     #[test]
+    fn lists_only_authority_rights() {
+        let (v, _, token) = setup(&[]);
+        let forged = append_code(&token, r#"right("web-9", "root");"#);
+        let rights: Vec<String> = crate::granted_rights(v.root_key(), &forged)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rights, ["web-1:deploy", "web-2:admin"]);
+        let (_, other_root, _) = setup(&[]);
+        assert!(crate::granted_rights(other_root.public(), &token).is_err());
+    }
+
+    #[test]
     fn grants_only_listed_rights() {
         let (v, _, token) = setup(&[]);
         assert!(allowed(&v, &token, &request("web-1", "deploy", "192.0.2.7")));

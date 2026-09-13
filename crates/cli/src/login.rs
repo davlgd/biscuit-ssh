@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use biscuit_ssh_ca::{fingerprint, parse_public_key};
 use biscuit_ssh_core::api::{CertificateRequest, CertificateResponse, ErrorResponse};
-use biscuit_ssh_core::{AccessRequest, Mode, PublicKey, failed_checks};
+use biscuit_ssh_core::{AccessRequest, Mode, PublicKey, Right, failed_checks, granted_rights};
 use ssh_key::Certificate;
 use ureq::http::Uri;
 use ureq::tls::{PemItem, RootCerts, TlsConfig};
@@ -30,26 +30,28 @@ pub struct Args {
     options: Options,
 }
 
-/// How to reach the issuer and what to certify; shared with `ssh`.
+/// The token, the key, and how to reach the issuer; shared with `ssh`.
 #[derive(Debug, clap::Args)]
 pub struct Options {
-    /// Issuer URL, e.g. `https://ssh-ca.example.com`.
+    /// Token file, `-` for standard input.
+    #[arg(short, long, value_name = "FILE", env = "BISCUIT_SSH_TOKEN_FILE")]
+    token: PathBuf,
+    /// SSH private key: the one certified by the issuer, or presented to the
+    /// bastion (which requires one); its public key is read from
+    /// `<identity>.pub` [default: ~/.ssh/id_ed25519].
+    #[arg(short, long, value_name = "FILE")]
+    identity: Option<PathBuf>,
+    /// Issuer URL, e.g. `https://ssh-ca.example.com` (certificates only).
     #[arg(long, env = "BISCUIT_SSH_ISSUER")]
     issuer: Option<String>,
-    /// Token file, `-` for standard input.
-    #[arg(short, long, env = "BISCUIT_SSH_TOKEN_FILE", default_value = "-")]
-    token: PathBuf,
-    /// SSH private key to certify; its public key is read from `<identity>.pub`
-    /// [default: ~/.ssh/id_ed25519].
-    #[arg(short, long)]
-    identity: Option<PathBuf>,
-    /// Command to force on the session, when the token requires one.
+    /// PEM root certificate to trust for the issuer instead of the public
+    /// web PKI, for a private deployment (certificates only).
+    #[arg(long, value_name = "FILE", env = "BISCUIT_SSH_ISSUER_CA")]
+    issuer_ca: Option<PathBuf>,
+    /// Command to force on the session, when the token requires one
+    /// (certificates only).
     #[arg(long)]
     command: Option<String>,
-    /// PEM root certificate to trust for the issuer instead of the public
-    /// web PKI, e.g. for a private deployment.
-    #[arg(long, value_name = "FILE")]
-    issuer_ca: Option<PathBuf>,
 }
 
 impl Options {
@@ -109,10 +111,13 @@ pub fn login(options: &Options, server: &str, user: &str) -> anyhow::Result<Logi
         command: options.command.clone(),
     };
     let agent = agent(options.issuer_ca.as_deref())?;
-    let mut response = agent
-        .post(&url)
-        .send_json(&request)
-        .with_context(|| format!("cannot reach {url}"))?;
+    let mut response = agent.post(&url).send_json(&request).map_err(|e| {
+        let hint = match e.to_string().contains("UnknownIssuer") {
+            true => " (if the issuer uses a private CA, pass it with --issuer-ca)",
+            false => "",
+        };
+        anyhow::Error::new(e).context(format!("cannot reach {url}{hint}"))
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let refusal = response.body_mut().read_json::<ErrorResponse>().ok();
@@ -164,7 +169,7 @@ fn explain(
     source_ip: IpAddr,
     time: u64,
 ) -> String {
-    let failed = (|| -> anyhow::Result<Vec<String>> {
+    let failed = (|| -> anyhow::Result<(Vec<String>, Vec<Right>)> {
         let url = endpoint(options.issuer()?, "root-key")?;
         let root_key: PublicKey = agent
             .get(&url)
@@ -185,15 +190,24 @@ fn explain(
             public_key: fingerprint(key),
             mode: Mode::Certificate,
         };
-        Ok(failed_checks(root_key, &request.token, &access)?)
+        let failed = failed_checks(root_key, &request.token, &access)?;
+        Ok((failed, granted_rights(root_key, &request.token)?))
     })();
     match failed {
-        Ok(checks) if checks.is_empty() => format!(
-            "\n  hint: no restriction of the token fails locally; it probably grants no access to {}@{}, \
-             or the issuer's policy refuses it",
-            request.user, request.server
-        ),
-        Ok(checks) => {
+        Ok((checks, rights)) if checks.is_empty() => {
+            let granted: Vec<String> = rights.iter().map(ToString::to_string).collect();
+            let requested = format!("{}:{}", request.server, request.user);
+            if granted.contains(&requested) {
+                "\n  hint: no restriction of the token fails locally; the issuer's policy may refuse it".to_owned()
+            } else {
+                format!(
+                    "\n  hint: the token grants {} but not {requested}; name the server as in the token \
+                     (with `biscuit-ssh ssh`, use --server when connecting by address)",
+                    granted.join(", ")
+                )
+            }
+        }
+        Ok((checks, _)) => {
             let list: String = checks.iter().map(|c| format!("\n    {c}")).collect();
             format!("\n  hint: restrictions of the token failing when evaluated locally:{list}")
         }
