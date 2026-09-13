@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow, bail};
-use biscuit_ssh_core::bastion_login;
+use biscuit_ssh_core::bastion_login::{self, Assembly, Progress};
 use biscuit_ssh_core::{AccessRequest, Mode, Name};
 use bytes::Bytes;
 use russh::keys::{HashAlg, PublicKey};
@@ -81,8 +81,8 @@ pub struct Connection {
     span: tracing::Span,
     /// Login name and fingerprint of the key the client proved it holds.
     verified_key: Option<(String, String)>,
-    /// Parts of the token received so far.
-    token_parts: Vec<String>,
+    /// The token received so far.
+    token_parts: Assembly,
     /// Set when the token was refused: the client has been told why, and
     /// the connection ends on its next answer.
     refused: bool,
@@ -117,7 +117,7 @@ impl Connection {
             peer,
             span: tracing::info_span!("client", %peer, server = tracing::field::Empty),
             verified_key: None,
-            token_parts: Vec::new(),
+            token_parts: Assembly::default(),
             refused: false,
             grant: None,
             cut: cutter.watch(),
@@ -303,7 +303,7 @@ impl russh::server::Handler for Connection {
             bail!("login refused");
         }
         let Some(mut response) = response else {
-            self.token_parts.clear();
+            self.token_parts = Assembly::default();
             return Ok(ask_token_part(1));
         };
         let answer = response
@@ -311,15 +311,11 @@ impl russh::server::Handler for Connection {
             .map(|t| String::from_utf8_lossy(&t).into_owned())
             .unwrap_or_default();
         // The token comes in parts, see `bastion_login`.
-        if let Some(part) = answer.strip_suffix(bastion_login::MORE) {
-            self.token_parts.push(part.to_owned());
-            if self.token_parts.len() >= bastion_login::MAX_PARTS {
-                let refused = Refused::new("invalid_token", anyhow!("token too long"));
-                return Ok(self.refuse(refused));
-            }
-            return Ok(ask_token_part(self.token_parts.len() + 1));
-        }
-        let token = std::mem::take(&mut self.token_parts).concat() + &answer;
+        let token = match self.token_parts.push(&answer) {
+            Ok(Progress::Next(part)) => return Ok(ask_token_part(part)),
+            Ok(Progress::Done(token)) => token,
+            Err(e) => return Ok(self.refuse(Refused::new("invalid_token", e.into()))),
+        };
         match self.authenticate(login, fingerprint, token).await {
             Ok(()) => Ok(Auth::Accept),
             Err(refused) => Ok(self.refuse(refused)),

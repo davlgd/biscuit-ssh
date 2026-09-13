@@ -17,12 +17,19 @@ pub const TOKEN_ENV: &str = "BISCUIT_SSH_ASKPASS_TOKEN";
 
 /// Runs as askpass when `ssh` started this process for a prompt: returns
 /// `None` otherwise.
-pub fn run_if_requested() -> Option<anyhow::Result<()>> {
+///
+/// `ssh` passes the prompt as the only argument. An option or one of
+/// `commands` is never a prompt: with [`TOKEN_ENV`] left in the environment,
+/// `biscuit-ssh --help` or `biscuit-ssh ssh` must still work.
+pub fn run_if_requested(commands: &[String]) -> Option<anyhow::Result<()>> {
     let token = std::env::var(TOKEN_ENV).ok()?;
     let mut args = std::env::args().skip(1);
     let (Some(prompt), None) = (args.next(), args.next()) else {
         return None;
     };
+    if prompt.starts_with('-') || commands.contains(&prompt) {
+        return None;
+    }
     Some(answer(&prompt, &token))
 }
 

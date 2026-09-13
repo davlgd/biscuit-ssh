@@ -18,7 +18,7 @@
 //! | `server($name)` | target server |
 //! | `user($name)` | account on the target server |
 //! | `command($cmd)` | forced command, only present when one is requested |
-//! | `public_key($fingerprint)` | `SHA256:...` fingerprint of the SSH key that will log in |
+//! | `public_key($fingerprint)` | `SHA256:...` fingerprint of the holder's SSH key (certified, or logging in to the bastion) |
 //! | `mode($mode)` | `"certificate"` or `"bastion"` |
 //!
 //! Any block can then restrict the token with checks on those facts; the

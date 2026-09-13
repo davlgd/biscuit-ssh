@@ -8,10 +8,14 @@ use anyhow::Context;
 use crate::askpass;
 use crate::login::{Login, Options, login};
 
-/// Gets a certificate and connects with it, e.g.
-/// `biscuit-ssh ssh deploy@web-1.example.com -p 2222 uptime`, or connects
-/// through a bastion with `--bastion`.
+/// Connect with a certificate, or through a bastion
+///
+/// Examples:
+///   biscuit-ssh ssh -t my.token deploy@web-1.example.com uptime
+///   biscuit-ssh ssh -t my.token --server web-1 deploy@192.0.2.10 -p 2222
+///   biscuit-ssh ssh -t my.token --bastion bastion.example.com:2200 deploy@web-1
 #[derive(Debug, clap::Args)]
+#[command(verbatim_doc_comment)]
 pub struct Args {
     /// Where to connect, as `user@host`.
     destination: String,

@@ -11,13 +11,13 @@ Give third parties SSH access to servers through [Biscuit](https://www.biscuitse
 Servers only trust an OpenSSH user CA (`TrustedUserCAKeys` + `AuthorizedPrincipalsFile`). Nothing Biscuit-specific runs on them. Two ways to reach them, sharing the same authorization core:
 
 - **Issuer**: a third party exchanges a Biscuit and an SSH public key for a short-lived OpenSSH certificate. Biscuit constraints are translated into certificate constraints enforced by `sshd` itself (`valid-before`, `source-address`, principals, `force-command`, `permit-*` extensions).
-- **Bastion**: an SSH server that verifies the Biscuit at login (public key, then token through keyboard-interactive), then relays session channels to targets only it can reach, logging in with an ephemeral key and a certificate from the same CA pinned to its own address. It keeps re-evaluating the token (leases of `session_check_interval`) and cuts connections at the exact second the token stops allowing them, at once on revocation. Per-command control and session recording come next.
+- **Bastion**: an SSH server that verifies the Biscuit at login (public key, then token through keyboard-interactive), then relays session channels to targets only it can reach, logging in with an ephemeral key and a certificate from the same CA pinned to its own address. It keeps re-evaluating the token (leases of `session_check_interval`): relaying stops at the exact second the token stops allowing access, or at the renewal that finds a revocation, and the sockets close at most 2 seconds later. Per-command control and session recording come next.
 
 Cargo workspace layout:
 
 ```
 crates/
-├── core/      # fact vocabulary, verifier, token minting/attenuation, revocation, API messages (single source of truth)
+├── core/      # fact vocabulary, verifier, token minting/attenuation, revocation, issuer API messages, bastion login prompts
 ├── ca/        # OpenSSH certificate signing, shared by issuer and bastion
 ├── service/   # plumbing shared by the services: authority (verifier, CA, revocations), logging, shutdown
 ├── issuer/    # binary `biscuit-ssh-issuer`: HTTP API, Biscuit → certificate
@@ -37,7 +37,8 @@ A certificate is derived from an `Authorization` only, which embeds the request 
 ### Bastion invariants
 
 - Requests from the client are handled in russh handler callbacks that wait for the target's answer before replying: russh keeps a single pending-reply flag per channel.
-- Every wait in a callback or relay task is cancellable by the cut (`access::until_cut`); a cut closes the client and target sockets themselves after a short graceful window, since russh sessions run in background tasks that a stalled peer could keep alive.
+- Handler callbacks wrap their waits in `access::until_cut`, and relay tasks watch the cut flag; what they may still be blocked on ends when the cut closes the client and target sockets themselves, after a short graceful window. Closing sockets is the guarantee, since russh sessions run in background tasks that a stalled peer could keep alive.
+- The token reaches the bastion in parts (`core::bastion_login`): OpenSSH caps each keyboard-interactive answer at 1023 bytes, below attenuated tokens.
 - russh uses `ssh-key` 0.7 while the CA uses 0.6: keys and certificates cross over in OpenSSH text format, in `target.rs` only.
 
 ## Constraints

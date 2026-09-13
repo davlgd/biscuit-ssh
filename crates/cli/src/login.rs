@@ -18,8 +18,11 @@ use crate::read_token;
 /// Bounds each exchange with the issuer.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Gets a certificate for the next SSH login. `ssh` picks it up by itself
-/// since it is written next to the private key, as `<identity>-cert.pub`.
+/// Get a certificate for plain `ssh` and other tools.
+///
+/// The certificate is written next to the private key, as
+/// `<identity>-cert.pub`, where `ssh` finds it by itself; it is valid for a
+/// few minutes. Example: `biscuit-ssh login web-1 deploy -t my.token`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// Target server, as named in the token.

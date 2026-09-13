@@ -110,13 +110,15 @@ pub struct AccessRequest {
     pub time: SystemTime,
     /// Client address as seen by the verifier (never taken from the client's own claims).
     pub source_ip: IpAddr,
-    /// Target server.
+    /// Server name, as in token rights (not a network address).
     pub server: Name,
-    /// Account on the target server.
+    /// Account on that server.
     pub user: Name,
     /// Command the session will be restricted to, if any.
     pub command: Option<Command>,
-    /// OpenSSH fingerprint (`SHA256:...`) of the key that will authenticate.
+    /// OpenSSH fingerprint (`SHA256:...`) of the holder's key: the one
+    /// certified, or the one that logged in to the bastion (not the
+    /// bastion's own key towards the server).
     pub public_key: String,
     /// How access will be enforced.
     pub mode: Mode,

@@ -5,8 +5,10 @@
 //! again for the next window, starting exactly where the lease ends, so the
 //! covered time is contiguous and every second the token refuses is caught.
 //! The connection is cut when the token stops allowing access, at that exact
-//! second, and at once if it is revoked or cannot be checked (so within
-//! `session_check_interval` of a revocation).
+//! second; a revocation, or a token that can no longer be checked, is found
+//! at the next renewal (so within `session_check_interval`) and cuts it
+//! then. Cutting stops relaying at once and closes the sockets at most
+//! [`DISCONNECT_GRACE`] later.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

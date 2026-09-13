@@ -7,11 +7,12 @@ use anyhow::{Context, bail};
 use biscuit_ssh_ca::{fingerprint, parse_public_key};
 use biscuit_ssh_core::{Command, Mode, Name, Network, Restriction};
 
-/// Restrictions to add to a token; each flag can be repeated to allow
-/// several values.
+/// Restrictions to add to a token; flags taking a list can be repeated to
+/// allow several values.
 #[derive(Debug, clap::Args)]
 pub struct Restrictions {
-    /// Expire after this long, e.g. 90s, 15m, 8h, 30d.
+    /// Expire this long from now, e.g. 90s, 15m, 8h, 30d (`token inspect`
+    /// shows the resulting time in UTC).
     #[arg(long, value_parser = parse_duration)]
     ttl: Option<Duration>,
     /// Only from this network, e.g. 192.0.2.0/24, 2001:db8::/32 or a single address.
@@ -30,7 +31,8 @@ pub struct Restrictions {
     /// Only with this SSH key: a SHA256 fingerprint or a public key file.
     #[arg(long = "public-key", value_name = "KEY")]
     public_keys: Vec<String>,
-    /// Only through this access mode.
+    /// Only through this way in, e.g. `bastion` for access that is cut as
+    /// soon as the token expires or is revoked.
     #[arg(long, value_enum)]
     mode: Option<ModeArg>,
 }
@@ -44,6 +46,11 @@ enum ModeArg {
 }
 
 impl Restrictions {
+    /// Whether the token will expire (`--ttl` given).
+    pub fn expires(&self) -> bool {
+        self.ttl.is_some()
+    }
+
     /// Turns the flags into restrictions, in a stable order.
     pub fn build(&self) -> anyhow::Result<Vec<Restriction>> {
         let mut restrictions = Vec::new();

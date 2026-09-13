@@ -58,13 +58,15 @@ impl Authorization {
         &self.request
     }
 
-    /// Revocation identifiers of the token's blocks, from the authority block.
+    /// Revocation identifiers of the token's blocks, in order, the authority
+    /// block first.
     pub fn revocation_ids(&self) -> &[String] {
         &self.revocation_ids
     }
 
     /// Revocation identifier of the token's last block, which names the
-    /// exact token presented.
+    /// exact token presented (its ancestors have the earlier ones). Logged by
+    /// the services and used as certificate key ID.
     pub fn token_id(&self) -> &str {
         // A token always has at least its authority block.
         self.revocation_ids.last().map_or("", String::as_str)

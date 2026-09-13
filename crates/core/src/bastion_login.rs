@@ -56,6 +56,48 @@ pub fn answer(token: &str, part: usize) -> Option<String> {
     })
 }
 
+/// Rebuilds a token from the answers to successive prompts, refusing any
+/// answer or total beyond the limits before storing it.
+#[derive(Debug, Default)]
+pub struct Assembly {
+    token: String,
+    parts: usize,
+}
+
+/// What an answer brought.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Ask for this part next.
+    Next(usize),
+    /// The whole token.
+    Done(String),
+}
+
+impl Assembly {
+    /// Adds the answer to the latest prompt.
+    pub fn push(&mut self, answer: &str) -> Result<Progress, crate::Error> {
+        let (part, more) = match answer.strip_suffix(MORE) {
+            Some(part) => (part, true),
+            None => (answer, false),
+        };
+        self.parts += 1;
+        if part.len() > MAX_PART_LEN
+            || self.token.len() + part.len() > MAX_TOKEN_LEN
+            || (more && self.parts >= MAX_PARTS)
+        {
+            return Err(crate::Error::InvalidInput {
+                field: "token",
+                reason: "too long",
+            });
+        }
+        self.token.push_str(part);
+        Ok(match more {
+            true => Progress::Next(self.parts + 1),
+            false => Progress::Done(std::mem::take(&mut self.token)),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +153,25 @@ mod tests {
             assert_eq!(rebuilt, token, "{len}");
         }
         assert_eq!(answer("abc", 0), None);
+    }
+
+    #[test]
+    fn assembles_answers_within_limits() {
+        let token = "T".repeat(2 * MAX_PART_LEN + 5);
+        let mut assembly = Assembly::default();
+        assert_eq!(assembly.push(&answer(&token, 1).unwrap()).unwrap(), Progress::Next(2));
+        assert_eq!(assembly.push(&answer(&token, 2).unwrap()).unwrap(), Progress::Next(3));
+        assert_eq!(
+            assembly.push(&answer(&token, 3).unwrap()).unwrap(),
+            Progress::Done(token)
+        );
+
+        let oversized = format!("{}{MORE}", "T".repeat(MAX_PART_LEN + 1));
+        assert!(Assembly::default().push(&oversized).is_err());
+
+        let mut endless = Assembly::default();
+        let full = format!("{}{MORE}", "T".repeat(MAX_PART_LEN));
+        let refused = (0..MAX_PARTS + 1).find(|_| endless.push(&full).is_err());
+        assert!(refused.is_some(), "an endless token must be refused");
     }
 }

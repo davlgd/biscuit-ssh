@@ -42,12 +42,13 @@ ISSUER_CA=()
 
 WORK=$(mktemp -d) || die "mktemp"
 ssh -o BatchMode=yes "$E2E_ADMIN" "sudo cat $E2E_REVOKED" >"$WORK/revoked.orig" || die "cannot read $E2E_REVOKED"
-remote=""
+remote="" remote_file=""
 restore() {
     local status=$?
     jobs -p | xargs kill 2>/dev/null
     [[ -S $WORK/mux ]] && ssh -S "$WORK/mux" -O exit x 2>/dev/null
     [[ -n $remote ]] && ssh -o BatchMode=yes "$E2E_ADMIN" "rm -rf '$remote'"
+    [[ -n $remote_file ]] && ssh -o BatchMode=yes "$E2E_ADMIN" "sudo rm -f '$remote_file'"
     if ssh -o BatchMode=yes "$E2E_ADMIN" "sudo tee $E2E_REVOKED >/dev/null" <"$WORK/revoked.orig"; then
         rm -rf "$WORK"
     else
@@ -184,6 +185,9 @@ if [[ -n ${E2E_BASTION:-} ]]; then
             -o UserKnownHostsFile="$WORK/known_hosts" -o StrictHostKeyChecking=accept-new "$@" </dev/null
     }
     target_host=${E2E_BASTION_TARGET%:*} target_port=${E2E_BASTION_TARGET##*:}
+    [[ $E2E_BASTION_TARGET == *:* && -n $target_host && $target_port =~ ^[0-9]+$ ]] &&
+        ((target_port >= 1 && target_port <= 65535)) ||
+        die "E2E_BASTION_TARGET must be host:port"
     if nc -z -w 3 "$target_host" "$target_port" 2>/dev/null; then
         ko "bastion: target reachable directly"
     else

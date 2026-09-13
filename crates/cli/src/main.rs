@@ -1,5 +1,5 @@
-//! `biscuit-ssh`: gets SSH certificates from the issuer, restricts and
-//! inspects tokens, and administers root keys.
+//! `biscuit-ssh`: connects with certificates from the issuer or through the
+//! bastion, restricts and inspects tokens, and administers root keys.
 
 mod askpass;
 mod login;
@@ -11,12 +11,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use biscuit_ssh_core::{KeyPair, PrivateKey, Right, attenuate, inspect, mint};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::restrict::Restrictions;
 
 #[derive(Parser)]
-#[command(version, about = "SSH access through Biscuit tokens")]
+#[command(
+    version,
+    about = "SSH access through Biscuit tokens",
+    after_help = "Start with `biscuit-ssh ssh --help`; the README explains the concepts."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -57,7 +61,7 @@ enum TokenCommand {
 #[derive(Subcommand)]
 enum AdminCommand {
     /// Generate a root key pair: writes the private key, prints the public
-    /// key for the issuer's `root_public_key`.
+    /// key for the services' `root_public_key`.
     Keygen {
         /// New file for the private key (created with mode 600).
         #[arg(short, long)]
@@ -77,7 +81,11 @@ enum AdminCommand {
 }
 
 fn main() -> anyhow::Result<()> {
-    if let Some(result) = askpass::run_if_requested() {
+    // `help` only appears once clap builds the command.
+    let mut cli = Cli::command();
+    cli.build();
+    let commands: Vec<String> = cli.get_subcommands().map(|c| c.get_name().to_owned()).collect();
+    if let Some(result) = askpass::run_if_requested(&commands) {
         return result;
     }
     match Cli::parse().command {
@@ -107,6 +115,9 @@ fn main() -> anyhow::Result<()> {
         }) => {
             let text = std::fs::read_to_string(&key).with_context(|| format!("cannot read {}", key.display()))?;
             let private: PrivateKey = text.trim().parse().context("invalid root private key")?;
+            if !restrictions.expires() {
+                eprintln!("warning: without --ttl, this token never expires (only revocation stops it)");
+            }
             println!("{}", mint(&KeyPair::from(&private), &rights, &restrictions.build()?)?);
             Ok(())
         }
@@ -118,7 +129,7 @@ pub(crate) fn read_token(path: &Path) -> anyhow::Result<String> {
     let mut token = String::new();
     if path == Path::new("-") {
         if std::io::stdin().is_terminal() {
-            bail!("no token given: use --token FILE, set BISCUIT_SSH_TOKEN_FILE, or pipe it");
+            bail!("no token on standard input: use -t FILE, or pipe it with -t -");
         }
         std::io::stdin()
             .read_to_string(&mut token)
