@@ -141,7 +141,7 @@ pub async fn guard(
 /// keep alive.
 pub struct Cutter {
     flag: watch::Sender<bool>,
-    sockets: Mutex<Vec<std::net::TcpStream>>,
+    sockets: Mutex<Vec<Option<std::net::TcpStream>>>,
     sessions: Mutex<Vec<Weak<TargetSession>>>,
 }
 
@@ -161,14 +161,34 @@ impl Cutter {
     pub fn new(client_socket: std::net::TcpStream) -> Arc<Self> {
         Arc::new(Self {
             flag: watch::channel(false).0,
-            sockets: Mutex::new(vec![client_socket]),
+            sockets: Mutex::new(vec![Some(client_socket)]),
             sessions: Mutex::new(Vec::new()),
         })
     }
 
-    /// Also closes `socket` on cut.
-    pub fn watch_socket(&self, socket: std::net::TcpStream) {
-        lock(&self.sockets).push(socket);
+    /// Also closes `socket` on cut, or right away if already cut, until
+    /// the returned registration is dropped without being kept.
+    pub fn watch_socket(&self, socket: std::net::TcpStream) -> WatchedSocket<'_> {
+        let mut sockets = lock(&self.sockets);
+        if *self.flag.borrow() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        // Reuse the slot of a forgotten socket, so failures cannot grow the list.
+        let index = match sockets.iter().position(Option::is_none) {
+            Some(free) => {
+                sockets[free] = Some(socket);
+                free
+            }
+            None => {
+                sockets.push(Some(socket));
+                sockets.len() - 1
+            }
+        };
+        WatchedSocket {
+            cutter: self,
+            index,
+            kept: false,
+        }
     }
 
     /// Also hangs up `session` on cut, while it is open.
@@ -206,7 +226,32 @@ impl Cutter {
             tokio::time::sleep(FLUSH_DELAY).await;
         };
         let _ = tokio::time::timeout(DISCONNECT_GRACE, farewell).await;
-        for socket in lock(&self.sockets).iter() {
+        for socket in lock(&self.sockets).iter().flatten() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// A socket registered with a [`Cutter`]. Unless kept, dropping it closes
+/// and forgets the socket: a failed connection must not linger until a cut.
+pub struct WatchedSocket<'a> {
+    cutter: &'a Cutter,
+    index: usize,
+    kept: bool,
+}
+
+impl WatchedSocket<'_> {
+    /// Keeps the socket registered for the rest of the connection.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for WatchedSocket<'_> {
+    fn drop(&mut self) {
+        if !self.kept
+            && let Some(socket) = lock(&self.cutter.sockets).get_mut(self.index).and_then(Option::take)
+        {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -223,8 +268,10 @@ pub async fn until_cut<T>(
     work: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     tokio::select! {
-        result = work => result,
+        // Checked first, so nothing starts once the connection is cut.
+        biased;
         _ = cut.wait_for(|cut| *cut) => anyhow::bail!("connection cut"),
+        result = work => result,
     }
 }
 
@@ -233,4 +280,58 @@ pub async fn until_cut<T>(
 fn instant_at(seconds: u64) -> Instant {
     let at = UNIX_EPOCH + Duration::from_secs(seconds);
     Instant::now() + at.duration_since(SystemTime::now()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A connected pair of sockets: (ours, the peer's).
+    fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        (ours, listener.accept().unwrap().0)
+    }
+
+    fn peer_sees_eof(peer: &mut std::net::TcpStream) -> bool {
+        use std::io::Read;
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        matches!(peer.read(&mut [0; 1]), Ok(0))
+    }
+
+    #[test]
+    fn forgets_sockets_of_failed_connections() {
+        let (client, _client_peer) = socket_pair();
+        let cutter = Cutter::new(client);
+
+        let (failed, mut failed_peer) = socket_pair();
+        drop(cutter.watch_socket(failed));
+        assert!(peer_sees_eof(&mut failed_peer), "a failed connection is closed at once");
+
+        let (kept, kept_peer) = socket_pair();
+        cutter.watch_socket(kept.try_clone().unwrap()).keep();
+        kept_peer.set_nonblocking(true).unwrap();
+        assert!(kept_peer.peek(&mut [0; 1]).is_err(), "a kept connection stays open");
+        drop(kept);
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_once_cut() {
+        let (flag, cut) = watch::channel(true);
+        let runs = AtomicUsize::new(0);
+        for _ in 0..1000 {
+            let result = until_cut(cut.clone(), async {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 0);
+
+        flag.send_replace(false);
+        assert!(until_cut(cut, async { Ok(()) }).await.is_ok());
+    }
 }

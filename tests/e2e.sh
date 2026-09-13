@@ -205,7 +205,8 @@ if [[ -n ${E2E_BASTION:-} ]]; then
     askpass=(env SSH_ASKPASS="$B" SSH_ASKPASS_REQUIRE=force BISCUIT_SSH_ASKPASS_TOKEN="$(<btoken)")
     bastion_opts=(-o IdentitiesOnly=yes -o UserKnownHostsFile="$WORK/known_hosts" -o User="$login_ok")
     head -c 5000000 /dev/urandom >big
-    printf 'put big big.up\nget big.up big.down\nrm big.up\n' >batch
+    remote_file="biscuit-ssh-e2e-$$-$RANDOM"
+    printf 'put big %s\nget %s big.down\nrm %s\n' "$remote_file" "$remote_file" "$remote_file" >batch
     if "${askpass[@]}" sftp -q -P "${E2E_BASTION##*:}" -i id_test "${bastion_opts[@]}" "${E2E_BASTION%:*}" \
         <batch >/dev/null 2>&1 && cmp -s big big.down; then
         ok "bastion: sftp transfer of 5 MB, identical"
@@ -225,34 +226,52 @@ if [[ -n ${E2E_BASTION:-} ]]; then
         "${askpass[@]}" ssh -p "${E2E_BASTION##*:}" -o PubkeyAuthentication=no "${bastion_opts[@]}" \
         "${E2E_BASTION%:*}" true
 
-    # Two channels on one connection: closing one keeps the other; expiry cuts both.
+    # Channels on one connection: one ends without disturbing the others,
+    # and expiry cuts all of those still active.
     mint -r "$E2E_BASTION_SERVER:$E2E_USER" --ttl 25s >t_mux
     expiry=$(($(date +%s) + 25))
     via t_mux "$login_ok" -M -S "$WORK/mux" -f -N
-    ssh -S "$WORK/mux" -o UserKnownHostsFile="$WORK/known_hosts" x 'sleep 120' >/dev/null 2>&1 &
-    long=$!
+    mux=(ssh -S "$WORK/mux" -o UserKnownHostsFile="$WORK/known_hosts" x)
+    "${mux[@]}" 'sleep 120' >/dev/null 2>&1 &
+    first=$!
+    "${mux[@]}" 'sleep 120' >/dev/null 2>&1 &
+    second=$!
     sleep 2
-    out=$(ssh -S "$WORK/mux" -o UserKnownHostsFile="$WORK/known_hosts" x 'echo second' 2>&1)
-    if [[ $out == second ]] && kill -0 "$long" 2>/dev/null; then
-        ok "bastion: second channel alongside the first"
+    out=$("${mux[@]}" 'echo third' 2>&1)
+    if [[ $out == third ]] && kill -0 "$first" "$second" 2>/dev/null; then
+        ok "bastion: channels independent on one connection"
     else
         ko "bastion: multiplexing: $out"
     fi
-    wait "$long"
+    wait "$first" "$second"
     ended=$(($(date +%s) - expiry))
-    if ((ended >= 0 && ended <= 2)); then ok "bastion: expiry cuts every channel (${ended}s)"; else ko "bastion: cut ${ended}s after expiry"; fi
+    if ((ended >= 0 && ended <= 2)); then ok "bastion: expiry cuts every active channel (${ended}s)"; else ko "bastion: cut ${ended}s after expiry"; fi
     ssh -S "$WORK/mux" -O exit x >/dev/null 2>&1
     left=$(ssh -o BatchMode=yes "$E2E_ADMIN" "pgrep -u $E2E_USER -f 'sleep 120' || true")
     if [[ -z $left ]]; then ok "bastion: nothing left running on the target"; else ko "bastion: processes left: $left"; fi
 
     mint -r "$E2E_BASTION_SERVER:$E2E_USER" --ttl 1h >t_rev
     id=$(revoked_id t_rev 0) || die "revocation id"
-    (sleep 3 && revoke "$id") &
-    start=$(date +%s)
-    via t_rev "$login_ok" 'sleep 60' >/dev/null 2>&1
-    wait
-    ended=$(($(date +%s) - start - 3))
-    if ((ended <= 11)); then ok "bastion: revocation cuts the session (${ended}s)"; else ko "bastion: revocation cut after ${ended}s"; fi
+    via t_rev "$login_ok" 'echo started; sleep 60; echo finished' >session.out 2>&1 &
+    session=$!
+    for _ in $(seq 20); do
+        grep -q started session.out && break
+        sleep 0.5
+    done
+    if grep -q started session.out; then
+        revoke "$id"
+        revoked_at=$(date +%s)
+        wait "$session"
+        ended=$(($(date +%s) - revoked_at))
+        if ((ended <= 12)) && ! grep -q finished session.out; then
+            ok "bastion: revocation cuts the session (${ended}s)"
+        else
+            ko "bastion: revocation cut after ${ended}s: $(<session.out)"
+        fi
+    else
+        kill "$session" 2>/dev/null
+        ko "bastion: revocation test session did not start: $(<session.out)"
+    fi
     revoke ""
     expect_fail "bastion: expired token refused" "Permission denied" via t_mux "$login_ok" true
 fi

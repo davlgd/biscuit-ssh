@@ -62,8 +62,9 @@ pub async fn pump(
 ) {
     loop {
         let message = tokio::select! {
-            message = from_target.wait() => message,
+            biased;
             _ = cut.wait_for(|cut| *cut) => break,
+            message = from_target.wait() => message,
         };
         let Some(message) = message else {
             break;

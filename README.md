@@ -167,7 +167,7 @@ Add a block's revocation identifier (from `token inspect`, also the certificate 
 ## Security notes
 
 - A certificate never outlives what its token allows: the token is evaluated at every second of the certificate lifetime, and validity stops at the first refusal.
-- `sshd` checks certificates when a session starts: expiration does not close sessions already open. The bastion does close them, at the second the token stops allowing access (or within `session_check_interval` of a revocation), and hangs up their commands; processes that detach themselves (`nohup`, `setsid`) survive, as with any SSH disconnection.
+- `sshd` checks certificates when a session starts: expiration does not close sessions already open. The bastion does: from the second the token stops allowing access (or within `session_check_interval` of a revocation), it relays nothing more, and it closes the client and target connections at most 2 seconds later. Before closing, it sends `HUP` to the remote commands, on a best-effort basis: a stalled target may not receive it, and processes that detach themselves (`nohup`, `setsid`) survive, as with any SSH disconnection.
 - The certificate is pinned to the client address the issuer sees, so `sshd` must see the same one: logging in through a jump host, a different NAT or another address family than the one used to reach the issuer is refused.
 - The issuer refuses to certify certificates, DSA keys or anything but plain OpenSSH public keys, and fails closed on any error, including an unreadable revocation list.
 

@@ -16,7 +16,7 @@ use ssh_key::rand_core::OsRng;
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::access::Grant;
+use crate::access::{Cutter, Grant};
 use crate::config::Settings;
 
 /// Bounds connecting to a target, including the SSH handshake.
@@ -47,15 +47,17 @@ impl client::Handler for TargetHost {
 
 /// Connects to the target of `grant` and logs in as its user.
 ///
-/// Also returns a duplicate of the connection's socket, to close it
-/// whatever the state of the SSH session. `permit` bounds the CPU spent on
+/// The socket is handed to `cutter` as soon as it is connected: russh runs
+/// the session in a background task from the start of the handshake, which
+/// only closing the socket reliably stops. `permit` bounds the CPU spent on
 /// the token check.
 pub async fn connect(
     settings: Arc<Settings>,
     grant: Arc<Grant>,
     permit: OwnedSemaphorePermit,
-) -> anyhow::Result<(TargetConnection, std::net::TcpStream)> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant, permit))
+    cutter: &Cutter,
+) -> anyhow::Result<TargetConnection> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant, permit, cutter))
         .await
         .context("connection to the target timed out")?
 }
@@ -64,12 +66,13 @@ async fn connect_inner(
     settings: Arc<Settings>,
     grant: Arc<Grant>,
     permit: OwnedSemaphorePermit,
-) -> anyhow::Result<(TargetConnection, std::net::TcpStream)> {
+    cutter: &Cutter,
+) -> anyhow::Result<TargetConnection> {
     let stream = TcpStream::connect(grant.target.address)
         .await
         .with_context(|| format!("cannot connect to {}", grant.target.address))?;
     let socket = stream.into_std()?;
-    let duplicate = socket.try_clone()?;
+    let watched = cutter.watch_socket(socket.try_clone()?);
     let stream = TcpStream::from_std(socket)?;
     // The address the target sees, which the certificate is pinned to.
     let bastion_ip = match grant.target.source_address {
@@ -98,7 +101,10 @@ async fn connect_inner(
         .authenticate_openssh_cert(user, Arc::new(key), certificate)
         .await?
     {
-        AuthResult::Success => Ok((connection, duplicate)),
+        AuthResult::Success => {
+            watched.keep();
+            Ok(connection)
+        }
         AuthResult::Failure { .. } => bail!("the target refused the bastion certificate"),
     }
 }

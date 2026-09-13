@@ -132,8 +132,8 @@ impl Connection {
         if self.target.is_none() {
             let (grant, _) = self.grant.as_ref().context("not authenticated")?;
             let permit = Arc::clone(&self.admission).acquire_owned().await?;
-            let (connection, socket) = target::connect(Arc::clone(&self.settings), Arc::clone(grant), permit).await?;
-            self.cutter.watch_socket(socket);
+            let connection =
+                target::connect(Arc::clone(&self.settings), Arc::clone(grant), permit, &self.cutter).await?;
             self.target = Some(connection);
         }
         let target = self.target.as_ref().context("no target connection")?;
