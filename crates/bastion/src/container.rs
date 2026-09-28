@@ -179,7 +179,13 @@ impl ContainerChannel {
     }
 
     /// Closes the command's input; its output keeps flowing.
+    ///
+    /// Ignored with a terminal, as sshd does: Docker would hang the terminal
+    /// up, and the command would lose its output.
     pub async fn eof(&mut self) -> anyhow::Result<()> {
+        if self.pty.is_some() {
+            return Ok(());
+        }
         if let Some(input) = self.exec.as_mut().and_then(|exec| exec.input.take()) {
             input.into_inner().shutdown().await?;
         }
