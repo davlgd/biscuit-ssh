@@ -21,22 +21,24 @@ API=https://sandbox.example.com:8444/v1/sandboxes
 ssh-keygen -q -t ed25519 -N '' -f sandbox_key                     # once
 
 # Create, for 10 minutes: may take minutes while the image is pulled, keep curl's timeout long.
-curl -sS "$API" -d '{"image": "python:3.13-slim", "ttl": 600}' > sandbox.json
+curl -4 -sS "$API" -d '{"image": "python:3.13-slim", "ttl": 600}' > sandbox.json
 NAME=$(jq -r .name sandbox.json)
 jq -r .token sandbox.json > "$NAME.token"
 jq -r .bastion_known_hosts sandbox.json > known_hosts          # trusts the bastion, no prompt
 
-# Run commands, as many times as needed (without a command and </dev/null: a shell).
-biscuit-ssh ssh --bastion "$(jq -r .bastion sandbox.json)" -t "$NAME.token" -i sandbox_key \
-    "$(jq -r .login sandbox.json)" -4 -o UserKnownHostsFile=known_hosts -o ConnectTimeout=15 \
-    'python3 --version' </dev/null
-echo 'print(6 * 7)' | biscuit-ssh ssh … 'python3 -'          # same options, script on stdin
+# Run commands, as many times as needed (`sb` alone: a shell).
+sb() {
+    biscuit-ssh ssh --bastion "$(jq -r .bastion sandbox.json)" -t "$NAME.token" -i sandbox_key \
+        "$(jq -r .login sandbox.json)" -4 -o UserKnownHostsFile=known_hosts -o ConnectTimeout=15 "$@"
+}
+sb 'python3 --version' </dev/null
+echo 'print(6 * 7)' | sb 'python3 -'                           # a script on stdin
 
 # Done: remove it now rather than at expiry.
-curl -sS -X DELETE "$API/$NAME"
+curl -4 -sS -X DELETE "$API/$NAME"
 ```
 
-The response's `command`, `biscuit-ssh ssh --bastion <bastion> -t <name>.token root@<name> -4`, is the same for pasting, from the directory holding the token file. The token only accepts the address it was requested from (`client_ip`): `-4` (or `-6`) keeps the connection on that address's family. Without `-i`, the client uses your default SSH key. The main README covers [scripts and agents](../README.md#from-scripts-and-agents) (no terminal, no prompts) and [troubleshooting](../README.md#troubleshooting) connections.
+The response's `command`, `biscuit-ssh ssh --bastion <bastion> -t <name>.token root@<name> -4`, is the same for pasting, from the directory holding the token file. The token only accepts the address it was requested from (`client_ip`): `-4` (or `-6`) keeps the connection on that address's family, and `curl -4` makes sure the request used it too. Without `-i`, the client uses your default SSH key. The main README covers [scripts and agents](../README.md#from-scripts-and-agents) (no terminal, no prompts) and [troubleshooting](../README.md#troubleshooting) connections.
 
 ## What a sandbox is
 
