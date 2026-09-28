@@ -6,7 +6,8 @@
 //! parts (see [`bastion_login`]).
 //!
 //! Only session channels are relayed (shell, exec, subsystems such as sftp,
-//! with terminal and signal handling). Port, agent and X11 forwarding,
+//! with terminal and signal handling), to a server over SSH or into a
+//! container (see [`container`]). Port, agent and X11 forwarding,
 //! environment variables and every other channel type are refused.
 
 use std::borrow::Cow;
@@ -25,8 +26,10 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, 
 use tokio::sync::{Semaphore, oneshot, watch};
 use tracing::Instrument;
 
+use crate::access::Target;
 use crate::access::{self, Cutter, Grant, until_cut};
 use crate::config::Settings;
+use crate::container::{self, ContainerChannel, Output};
 use crate::relay::{self, Relay, Replies};
 use crate::target::{self, TargetConnection};
 
@@ -37,6 +40,14 @@ fn ask_token_part(part: usize) -> Auth {
         instructions: Cow::Borrowed(""),
         prompts: Cow::Owned(vec![(Cow::Owned(bastion_login::prompt(part)), false)]),
     }
+}
+
+/// The target side of a session channel.
+enum SessionChannel {
+    /// Relayed to a server's SSH channel.
+    Ssh(Relay),
+    /// Run in a container.
+    Container(ContainerChannel),
 }
 
 /// How long a forwarded request may wait for the target's answer.
@@ -91,8 +102,9 @@ pub struct Connection {
     cutter: Arc<Cutter>,
     /// Becomes true when the connection is cut.
     cut: watch::Receiver<bool>,
+    /// The SSH connection to a server target, opened on first use.
     target: Option<TargetConnection>,
-    relays: HashMap<ChannelId, Relay>,
+    channels: HashMap<ChannelId, SessionChannel>,
 }
 
 /// A request forwarded to the target, which answers it.
@@ -123,7 +135,7 @@ impl Connection {
             cut: cutter.watch(),
             cutter,
             target: None,
-            relays: HashMap::new(),
+            channels: HashMap::new(),
         }
     }
 
@@ -133,13 +145,10 @@ impl Connection {
             .rsplit_once('@')
             .and_then(|(user, server)| Some((user.parse::<Name>().ok()?, server.parse::<Name>().ok()?)))
             .ok_or(Refused::new("invalid_login", anyhow!("invalid login")))?;
-        // Reported as a mere denial, so clients cannot enumerate targets.
-        let target = self
-            .settings
-            .targets
-            .get(&server)
-            .ok_or_else(|| Refused::new("denied", anyhow!("unknown server {server}")))?
-            .clone();
+        let permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| Refused::new("busy", anyhow!("too many logins")))?;
+        let target = self.resolve(&server).await?;
         let request = AccessRequest {
             time: SystemTime::now(),
             source_ip: self.peer,
@@ -150,10 +159,6 @@ impl Connection {
             mode: Mode::Bastion,
         };
         let grant = Arc::new(Grant { token, request, target });
-
-        let permit = Arc::clone(&self.admission)
-            .try_acquire_owned()
-            .map_err(|_| Refused::new("busy", anyhow!("too many logins")))?;
         let (settings, checked) = (Arc::clone(&self.settings), Arc::clone(&grant));
         let authorization = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -175,6 +180,22 @@ impl Connection {
         Ok(())
     }
 
+    /// Where sessions for `server` go: a configured server, else a labelled
+    /// running container of that name. Unknown names are reported as mere
+    /// denials, so clients cannot enumerate targets.
+    async fn resolve(&self, server: &Name) -> Result<Target, Refused> {
+        if let Some(server) = self.settings.servers.get(server) {
+            return Ok(Target::Server(server.clone()));
+        }
+        let unknown = || Refused::new("denied", anyhow!("unknown server {server}"));
+        let containers = self.settings.containers.as_ref().ok_or_else(unknown)?;
+        match container::find(containers, server).await {
+            Ok(Some(id)) => Ok(Target::Container(id)),
+            Ok(None) => Err(unknown()),
+            Err(e) => Err(Refused::new("internal", e)),
+        }
+    }
+
     /// Logs a refused login and tells the client why. SSH has no refusal
     /// message: an extra round without prompts shows the reason, and the
     /// connection ends on the client's answer.
@@ -188,14 +209,22 @@ impl Connection {
         }
     }
 
-    /// Opens the target side of a new session channel, connecting to the
-    /// target on first use.
-    async fn open_relay(&mut self, id: ChannelId, client: russh::server::Handle) -> anyhow::Result<()> {
+    /// Opens the target side of a new session channel, connecting to a
+    /// server target on first use.
+    async fn open_channel(&mut self, id: ChannelId, client: russh::server::Handle) -> anyhow::Result<()> {
+        let (grant, _) = self.grant.as_ref().context("not authenticated")?;
+        let server = match &grant.target {
+            Target::Server(server) => server.clone(),
+            Target::Container(_) => {
+                self.channels
+                    .insert(id, SessionChannel::Container(ContainerChannel::default()));
+                return Ok(());
+            }
+        };
         if self.target.is_none() {
-            let (grant, _) = self.grant.as_ref().context("not authenticated")?;
+            let grant = Arc::clone(grant);
             let permit = Arc::clone(&self.admission).acquire_owned().await?;
-            let connection =
-                target::connect(Arc::clone(&self.settings), Arc::clone(grant), permit, &self.cutter).await?;
+            let connection = target::connect(Arc::clone(&self.settings), grant, &server, permit, &self.cutter).await?;
             self.target = Some(connection);
         }
         let target = self.target.as_ref().context("no target connection")?;
@@ -205,12 +234,61 @@ impl Connection {
         let replies = Replies::default();
         let pump = relay::pump(from_target, client, id, replies.clone(), self.cutter.watch());
         tokio::spawn(pump.instrument(self.span.clone()));
-        self.relays.insert(id, Relay { to_target, replies });
+        self.channels
+            .insert(id, SessionChannel::Ssh(Relay { to_target, replies }));
         Ok(())
     }
 
     fn relay(&self, id: ChannelId) -> anyhow::Result<&Relay> {
-        self.relays.get(&id).context("unknown channel")
+        match self.channels.get(&id) {
+            Some(SessionChannel::Ssh(relay)) => Ok(relay),
+            _ => bail!("unknown channel"),
+        }
+    }
+
+    /// The container session of channel `id`, if it is one.
+    fn container_channel(&mut self, id: ChannelId) -> Option<&mut ContainerChannel> {
+        match self.channels.get_mut(&id) {
+            Some(SessionChannel::Container(channel)) => Some(channel),
+            _ => None,
+        }
+    }
+
+    /// Starts `command`, or a shell, in the container of channel `id`, and
+    /// tells the client whether it started.
+    async fn start_in_container(
+        &mut self,
+        id: ChannelId,
+        command: Option<&[u8]>,
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
+        let output = Output {
+            client: session.handle(),
+            channel: id,
+            cut: self.cut.clone(),
+        };
+        let (grant, _) = self.grant.as_ref().context("not authenticated")?;
+        let (Target::Container(container), Some(containers)) = (&grant.target, &self.settings.containers) else {
+            bail!("not a container session");
+        };
+        let (container, user, docker) = (container.clone(), grant.request.user.clone(), containers.docker.clone());
+        let channel = self.container_channel(id).context("unknown channel")?;
+        let cut = output.cut.clone();
+        let started = until_cut(cut, channel.start(&docker, &container, user.as_str(), command, output)).await;
+        match started {
+            Ok(()) => session.channel_success(id)?,
+            Err(error) => {
+                tracing::warn!(parent: &self.span, error = %error, "cannot start the command");
+                session.channel_failure(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The Docker client, for container sessions.
+    fn docker(&self) -> anyhow::Result<bollard::Docker> {
+        let containers = self.settings.containers.as_ref().context("containers are disabled")?;
+        Ok(containers.docker.clone())
     }
 
     /// Forwards `request` to the target; the receiver gets its answer.
@@ -258,7 +336,14 @@ impl Drop for Connection {
     /// (sshd only hangs up terminals), so each session is sent `HUP` first.
     /// Processes that detach themselves (`nohup`, `setsid`) still survive.
     fn drop(&mut self) {
-        let relays: Vec<Relay> = self.relays.drain().map(|(_, relay)| relay).collect();
+        let relays: Vec<Relay> = self
+            .channels
+            .drain()
+            .filter_map(|(_, channel)| match channel {
+                SessionChannel::Ssh(relay) => Some(relay),
+                SessionChannel::Container(_) => None,
+            })
+            .collect();
         if let Some(target) = self.target.take() {
             tokio::spawn(async move {
                 for relay in relays {
@@ -346,7 +431,7 @@ impl russh::server::Handler for Connection {
         drop(channel);
         let client = session.handle();
         let cut = self.cut.clone();
-        match until_cut(cut, self.open_relay(id, client)).await {
+        match until_cut(cut, self.open_channel(id, client)).await {
             Ok(()) => reply.accept().await,
             Err(error) => {
                 tracing::warn!(parent: &self.span, error = %error, "cannot reach the target");
@@ -367,6 +452,18 @@ impl russh::server::Handler for Connection {
         modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(channel) = self.container_channel(id) {
+            let pty = container::Pty {
+                term: term.to_owned(),
+                width: u16::try_from(col_width).unwrap_or(u16::MAX),
+                height: u16::try_from(row_height).unwrap_or(u16::MAX),
+            };
+            match channel.request_pty(pty) {
+                Ok(()) => session.channel_success(id)?,
+                Err(_) => session.channel_failure(id)?,
+            }
+            return Ok(());
+        }
         let size = (col_width, row_height, pix_width, pix_height);
         let reply = self.forward(id, Request::Pty { term, size, modes }).await?;
         self.answer(id, reply, session).await
@@ -374,18 +471,29 @@ impl russh::server::Handler for Connection {
 
     async fn shell_request(&mut self, id: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
         tracing::info!(parent: &self.span, "shell");
+        if self.container_channel(id).is_some() {
+            return self.start_in_container(id, None, session).await;
+        }
         let reply = self.forward(id, Request::Shell).await?;
         self.answer(id, reply, session).await
     }
 
     async fn exec_request(&mut self, id: ChannelId, command: &[u8], session: &mut Session) -> Result<(), Self::Error> {
         tracing::info!(parent: &self.span, command = %String::from_utf8_lossy(command), "exec");
+        if self.container_channel(id).is_some() {
+            return self.start_in_container(id, Some(command), session).await;
+        }
         let reply = self.forward(id, Request::Exec(command)).await?;
         self.answer(id, reply, session).await
     }
 
     async fn subsystem_request(&mut self, id: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
         tracing::info!(parent: &self.span, subsystem = name, "subsystem");
+        if self.container_channel(id).is_some() {
+            // Containers have no subsystems such as sftp.
+            session.channel_failure(id)?;
+            return Ok(());
+        }
         let reply = self.forward(id, Request::Subsystem(name)).await?;
         self.answer(id, reply, session).await
     }
@@ -417,6 +525,18 @@ impl russh::server::Handler for Connection {
         pix_height: u32,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.container_channel(id).is_some() {
+            let docker = self.docker()?;
+            let cut = self.cut.clone();
+            let channel = self.container_channel(id).context("unknown channel")?;
+            let (width, height) = (
+                u16::try_from(col_width).unwrap_or(u16::MAX),
+                u16::try_from(row_height).unwrap_or(u16::MAX),
+            );
+            // A failed resize keeps the previous size: not worth ending the session.
+            let _ = until_cut(cut, channel.resize(&docker, width, height)).await;
+            return Ok(());
+        }
         until_cut(self.cut.clone(), async {
             let to_target = &self.relay(id)?.to_target;
             Ok(to_target
@@ -427,6 +547,10 @@ impl russh::server::Handler for Connection {
     }
 
     async fn signal(&mut self, id: ChannelId, signal: Sig, _: &mut Session) -> Result<(), Self::Error> {
+        if self.container_channel(id).is_some() {
+            // Docker cannot signal an exec.
+            return Ok(());
+        }
         until_cut(self.cut.clone(), async {
             Ok(self.relay(id)?.to_target.signal(signal).await?)
         })
@@ -434,6 +558,10 @@ impl russh::server::Handler for Connection {
     }
 
     async fn data(&mut self, id: ChannelId, data: &[u8], _: &mut Session) -> Result<(), Self::Error> {
+        let cut = self.cut.clone();
+        if let Some(channel) = self.container_channel(id) {
+            return until_cut(cut, channel.write(data)).await;
+        }
         until_cut(self.cut.clone(), async {
             let to_target = &self.relay(id)?.to_target;
             Ok(to_target.data_bytes(Bytes::copy_from_slice(data)).await?)
@@ -442,17 +570,16 @@ impl russh::server::Handler for Connection {
     }
 
     async fn channel_eof(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
-        until_cut(self.cut.clone(), async {
-            if let Some(relay) = self.relays.get(&id) {
-                relay.to_target.eof().await?;
-            }
-            Ok(())
-        })
-        .await
+        let cut = self.cut.clone();
+        match self.channels.get_mut(&id) {
+            Some(SessionChannel::Ssh(relay)) => until_cut(cut, async { Ok(relay.to_target.eof().await?) }).await,
+            Some(SessionChannel::Container(channel)) => until_cut(cut, channel.eof()).await,
+            None => Ok(()),
+        }
     }
 
     async fn channel_close(&mut self, id: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
-        if let Some(relay) = self.relays.remove(&id) {
+        if let Some(SessionChannel::Ssh(relay)) = self.channels.remove(&id) {
             let _ = until_cut(self.cut.clone(), async { Ok(relay.to_target.close().await?) }).await;
         }
         Ok(())

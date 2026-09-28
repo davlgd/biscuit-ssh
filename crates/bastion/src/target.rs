@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::access::{Cutter, Grant};
-use crate::config::Settings;
+use crate::config::{Server, Settings};
 
 /// Bounds connecting to a target, including the SSH handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,10 +54,11 @@ impl client::Handler for TargetHost {
 pub async fn connect(
     settings: Arc<Settings>,
     grant: Arc<Grant>,
+    server: &Server,
     permit: OwnedSemaphorePermit,
     cutter: &Cutter,
 ) -> anyhow::Result<TargetConnection> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant, permit, cutter))
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(settings, grant, server, permit, cutter))
         .await
         .context("connection to the target timed out")?
 }
@@ -65,17 +66,18 @@ pub async fn connect(
 async fn connect_inner(
     settings: Arc<Settings>,
     grant: Arc<Grant>,
+    server: &Server,
     permit: OwnedSemaphorePermit,
     cutter: &Cutter,
 ) -> anyhow::Result<TargetConnection> {
-    let stream = TcpStream::connect(grant.target.address)
+    let stream = TcpStream::connect(server.address)
         .await
-        .with_context(|| format!("cannot connect to {}", grant.target.address))?;
+        .with_context(|| format!("cannot connect to {}", server.address))?;
     let socket = stream.into_std()?;
     let watched = cutter.watch_socket(socket.try_clone()?);
     let stream = TcpStream::from_std(socket)?;
     // The address the target sees, which the certificate is pinned to.
-    let bastion_ip = match grant.target.source_address {
+    let bastion_ip = match server.source_address {
         Some(address) => address,
         None => stream.local_addr()?.ip(),
     };
@@ -91,7 +93,7 @@ async fn connect_inner(
 
     let config = Arc::new(client::Config::default());
     let host = TargetHost {
-        host_key: grant.target.host_key.clone(),
+        host_key: server.host_key.clone(),
     };
     let mut connection = client::connect_stream(config, stream, host)
         .await

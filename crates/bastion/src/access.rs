@@ -18,7 +18,7 @@ use russh::{Disconnect, Sig};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::config::{Settings, Target};
+use crate::config::{Server, Settings};
 
 /// How long before a lease ends its renewal starts.
 const RENEWAL_MARGIN: u64 = 5;
@@ -30,8 +30,18 @@ pub struct Grant {
     pub token: String,
     /// The request as authenticated; only its time changes afterwards.
     pub request: AccessRequest,
-    /// The server connections are relayed to.
+    /// Where sessions are relayed to.
     pub target: Target,
+}
+
+/// Where the sessions of a connection go, resolved when it logs in.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A server, reached over SSH; tokens are checked with the main root key.
+    Server(Server),
+    /// A container, reached through Docker by its immutable ID; tokens are
+    /// checked with the containers' root key.
+    Container(String),
 }
 
 /// Why a token check failed.
@@ -63,17 +73,21 @@ impl Grant {
         time: SystemTime,
         lifetime: Duration,
     ) -> Result<Authorization, Refusal> {
-        let revoked = settings
-            .authority
-            .revocations()
-            .map_err(|_| Refusal::Immediate("revocation_list_unreadable"))?;
+        // Each kind of target has its own root key and revocations, so a
+        // token for containers can never reach a server, and conversely.
+        let (verifier, revocations) = match &self.target {
+            Target::Server(_) => (&settings.authority.verifier, settings.authority.revocations()),
+            Target::Container(_) => {
+                let containers = settings.containers.as_ref().ok_or(Refusal::Immediate("internal"))?;
+                (&containers.verifier, containers.revocations.read())
+            }
+        };
+        let revoked = revocations.map_err(|_| Refusal::Immediate("revocation_list_unreadable"))?;
         let request = AccessRequest {
             time,
             ..self.request.clone()
         };
-        settings
-            .authority
-            .verifier
+        verifier
             .authorize(&self.token, &request, &revoked, lifetime)
             .map_err(|e| match e {
                 biscuit_ssh_core::Error::Denied(_) => Refusal::Denied,

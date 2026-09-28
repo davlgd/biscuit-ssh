@@ -8,6 +8,7 @@
 
 mod access;
 mod config;
+mod container;
 mod relay;
 mod server;
 mod target;
@@ -40,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     biscuit_ssh_service::init_tracing();
     let args = Args::parse();
     let config = Config::load(&args.config)?;
-    let settings = Arc::new(config.settings()?);
+    let settings = Arc::new(config.settings().await?);
 
     let ssh = Arc::new(russh::server::Config {
         keys: vec![settings.host_key.clone()],
@@ -57,7 +58,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
     // Clients verify it on first connection: operators hand it out.
     let host_key = settings.host_key.public_key().fingerprint(russh::keys::HashAlg::Sha256);
-    tracing::info!(listen = %config.listen, targets = settings.targets.len(), %host_key, "listening");
+    tracing::info!(
+        listen = %config.listen,
+        servers = settings.servers.len(),
+        containers = settings.containers.is_some(),
+        %host_key,
+        "listening"
+    );
 
     let shutdown = biscuit_ssh_service::shutdown_signal();
     tokio::pin!(shutdown);

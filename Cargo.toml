@@ -35,3 +35,6 @@ bytes = "1.12.1"
 # SSH server and client of the bastion, on ring like the rest of the workspace.
 russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
 rpassword = "7.5.4"
+# Docker Engine API, for the bastion's container targets and the sandbox.
+bollard = "0.21.1"
+futures-util = "0.3.34"
