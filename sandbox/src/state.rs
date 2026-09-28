@@ -70,7 +70,11 @@ pub struct Store {
 impl Store {
     /// Opens the state in `dir`, taking its lock, or creates it with a new
     /// instance identifier.
-    pub fn open(dir: &Path, revocation_list: &Path, new_instance: impl FnOnce() -> String) -> anyhow::Result<Self> {
+    pub fn open(
+        dir: &Path,
+        revocation_list: &Path,
+        new_instance: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         let lock = File::create(dir.join("lock"))?;
         if lock.try_lock().is_err() {
@@ -80,7 +84,7 @@ impl Store {
         let state = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("invalid {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State {
-                instance: new_instance(),
+                instance: new_instance()?,
                 ..State::default()
             },
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -138,7 +142,7 @@ mod tests {
     fn persists_state_and_projects_revocations() {
         let dir = temporary_dir("state");
         let list = dir.join("revoked");
-        let mut store = Store::open(&dir, &list, || "instance-1".to_owned()).unwrap();
+        let mut store = Store::open(&dir, &list, || Ok("instance-1".to_owned())).unwrap();
         store.state.revoked.insert("aa".repeat(64), 100);
         store.state.revoked.insert("bb".repeat(64), 200);
         store.state.sandboxes.insert(
@@ -170,10 +174,10 @@ mod tests {
     fn allows_one_instance_at_a_time() {
         let dir = temporary_dir("lock");
         let list = dir.join("revoked");
-        let first = Store::open(&dir, &list, || "i".to_owned()).unwrap();
-        assert!(Store::open(&dir, &list, || "i".to_owned()).is_err());
+        let first = Store::open(&dir, &list, || Ok("i".to_owned())).unwrap();
+        assert!(Store::open(&dir, &list, || Ok("i".to_owned())).is_err());
         drop(first);
-        assert!(Store::open(&dir, &list, || "i".to_owned()).is_ok());
+        assert!(Store::open(&dir, &list, || Ok("i".to_owned())).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

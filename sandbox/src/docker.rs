@@ -2,7 +2,7 @@
 //!
 //! Containers run without network (the bastion reaches them through the
 //! Docker API, not over the network), with bounded memory, CPU, processes
-//! and logs, and cannot gain privileges. Every operation addresses a
+//! and logs, a reduced set of capabilities, and cannot gain privileges. Every operation addresses a
 //! container by its immutable ID, except the lookup of a name left over by
 //! a crash, which is checked against this instance's label.
 
@@ -123,6 +123,15 @@ pub async fn run(
             nano_cpus: Some(limits.nano_cpus),
             pids_limit: Some(limits.pids),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
+            // Only what a shell session commonly needs as root: files and
+            // processes of its own; no raw sockets, devices, chroot or
+            // capability changes.
+            cap_drop: Some(vec!["ALL".to_owned()]),
+            cap_add: Some(
+                ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
             storage_opt: limits
                 .disk
                 .clone()
@@ -187,9 +196,21 @@ async fn shell_works(docker: &Docker, id: &str, user: &str) -> anyhow::Result<bo
         output_capacity: None,
     };
     if let StartExecResults::Attached { mut output, .. } = docker.start_exec(&exec.id, Some(start)).await? {
-        while output.next().await.is_some() {}
+        while let Some(item) = output.next().await {
+            if item.is_err() {
+                return Ok(false);
+            }
+        }
     }
-    Ok(docker.inspect_exec(&exec.id).await?.exit_code == Some(0))
+    // Only a command Docker reports as finished has a meaningful status.
+    for _ in 0..25 {
+        let inspected = docker.inspect_exec(&exec.id).await?;
+        if inspected.running == Some(false) {
+            return Ok(inspected.exit_code == Some(0));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(false)
 }
 
 /// Removes container `id` and its anonymous volumes, stopping it if needed.

@@ -130,7 +130,13 @@ impl Sandboxes {
     pub async fn create(&self, image: &ImageRef, ttl: Option<u64>, client: IpAddr) -> Result<Lease, Failure> {
         let ttl = self.ttl(ttl)?;
         let _creating = self.creations.try_acquire().map_err(|_| Failure::TooMany)?;
-        let name = format!("sb-{}", random_hex());
+        let name = format!(
+            "sb-{}",
+            random_hex().map_err(|e| {
+                tracing::error!(error = %e, "cannot name a sandbox");
+                Failure::Unavailable
+            })?
+        );
         let instance = {
             let mut store = self.store.lock().await;
             if store.state.sandboxes.len() >= self.settings.max_sandboxes {
@@ -452,10 +458,8 @@ pub fn now() -> u64 {
 }
 
 /// 128 random bits, in hex.
-pub fn random_hex() -> String {
+pub fn random_hex() -> anyhow::Result<String> {
     let mut bytes = [0u8; 16];
-    // Without a random source, names and identifiers could collide: better
-    // not to run at all.
-    getrandom::fill(&mut bytes).expect("the system random source is unavailable");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no system random source: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }

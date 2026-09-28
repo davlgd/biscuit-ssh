@@ -178,10 +178,15 @@ impl Config {
             limits.max_sandboxes > 0 && limits.max_creations > 0,
             "limits must be positive"
         );
+        ensure!(limits.memory_mb > 0 && limits.pids > 0, "limits must be positive");
         ensure!(
-            limits.memory_mb > 0 && limits.cpus > 0.0 && limits.pids > 0,
-            "limits must be positive"
+            limits.cpus.is_finite() && limits.cpus > 0.0 && limits.cpus <= 1024.0,
+            "limits.cpus must be between 0 and 1024"
         );
+        let memory = limits
+            .memory_mb
+            .checked_mul(1024 * 1024)
+            .context("limits.memory_mb is too large")?;
         ensure!(!self.label.is_empty(), "label must not be empty");
         let text = std::fs::read_to_string(&self.signing_key)
             .with_context(|| format!("cannot read {}", self.signing_key.display()))?;
@@ -199,7 +204,7 @@ impl Config {
             max_sandboxes: limits.max_sandboxes,
             max_creations: limits.max_creations,
             limits: Limits {
-                memory: limits.memory_mb * 1024 * 1024,
+                memory,
                 // Whole billionths of a CPU; the fraction is dropped on purpose.
                 nano_cpus: (limits.cpus * 1e9) as i64,
                 pids: limits.pids,
@@ -236,7 +241,14 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_and_bad_limits() {
         assert!(toml::from_str::<Config>(&format!("{BASE}extra = 1")).is_err());
-        for limits in ["lifetime = 59", "lifetime = 3601", "max_sandboxes = 0", "cpus = 0.0"] {
+        for limits in [
+            "lifetime = 59",
+            "lifetime = 3601",
+            "max_sandboxes = 0",
+            "cpus = 0.0",
+            "cpus = inf",
+            "memory_mb = 9223372036854775807",
+        ] {
             let config: Config = toml::from_str(&format!("{BASE}[limits]\n{limits}")).unwrap();
             let error = config.settings().err().unwrap().to_string();
             assert!(error.contains("limits"), "{limits}: {error}");

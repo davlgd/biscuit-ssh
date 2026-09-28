@@ -134,6 +134,11 @@ ssh -o BatchMode=yes "$E2E_ADMIN" "sudo biscuit-ssh admin mint -k $E2E_SANDBOX_K
 out=$(via sandbox-key.token "$E2E_SERVER_USER@$E2E_SERVER" true 2>&1)
 check "sandbox key cannot reach a server" '[[ $out == *"access refused"* ]]' "$out"
 
+code=$("${CURL[@]}" -X POST -H 'Content-Type:' --data-binary garbage -o body -w '%{http_code}' \
+    "$E2E_API/v1/sandboxes/$first/renew")
+check "renew with an invalid body → 400" '[[ $code == 400 ]]' "$code"
+out=$(via "token.$first" "root@$first" 'grep CapEff /proc/self/status' 2>&1)
+check "reduced capabilities" '[[ $out == "CapEff:"*"00000000000000fb" ]]' "$out"
 cp "token.$first" "old.$first"
 api POST "/v1/sandboxes/$first/renew" '{"ttl":3600}'
 check "renew → 200" '[[ $code == 200 ]]' "$code $(cat body)"

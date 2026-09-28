@@ -15,6 +15,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -140,12 +141,17 @@ async fn renew(
     State(sandboxes): State<Arc<Sandboxes>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(name): Path<String>,
-    body: Result<Option<Json<RenewRequest>>, JsonRejection>,
+    body: Bytes,
 ) -> Response {
-    let Ok(body) = body else {
+    // The body is optional; when present, it must be a valid request,
+    // whatever its content type says.
+    let body = match body.is_empty() {
+        true => Ok(RenewRequest::default()),
+        false => serde_json::from_slice::<RenewRequest>(&body),
+    };
+    let Ok(RenewRequest { ttl }) = body else {
         return error(StatusCode::BAD_REQUEST, "invalid request");
     };
-    let ttl = body.and_then(|Json(body)| body.ttl);
     match sandboxes.renew(&name, ttl, peer.ip().to_canonical()).await {
         Ok(lease) => Json(lease_response(&sandboxes, lease)).into_response(),
         Err(failure) => failure_response(&failure),
