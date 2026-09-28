@@ -11,7 +11,9 @@ Give third parties SSH access to servers through [Biscuit](https://www.biscuitse
 Servers only trust an OpenSSH user CA (`TrustedUserCAKeys` + `AuthorizedPrincipalsFile`). Nothing Biscuit-specific runs on them. Two ways to reach them, sharing the same authorization core:
 
 - **Issuer**: a third party exchanges a Biscuit and an SSH public key for a short-lived OpenSSH certificate. Biscuit constraints are translated into certificate constraints enforced by `sshd` itself (`valid-before`, `source-address`, principals, `force-command`, `permit-*` extensions).
-- **Bastion**: an SSH server that verifies the Biscuit at login (public key, then token through keyboard-interactive), then relays session channels to targets only it can reach, logging in with an ephemeral key and a certificate from the same CA pinned to its own address. It keeps re-evaluating the token (leases of `session_check_interval`): relaying stops at the exact second the token stops allowing access, or at the renewal that finds a revocation, and the sockets close at most 2 seconds later. Per-command control and session recording come next.
+- **Bastion**: an SSH server that verifies the Biscuit at login (public key, then token through keyboard-interactive), then relays session channels to targets only it can reach, logging in with an ephemeral key and a certificate from the same CA pinned to its own address. It keeps re-evaluating the token (leases of `session_check_interval`): relaying stops at the exact second the token stops allowing access, or at the renewal that finds a revocation, and the sockets close at most 2 seconds later. It can also run sessions in Docker containers (`[containers]`, unreleased), through `docker exec`, with a root key and revocation list of their own. Per-command control and session recording come next.
+
+**Sandbox** (`sandbox/`, unreleased): a separate application on top of biscuit-ssh, a REST service creating disposable containers from Docker Hub images, reachable only through the bastion with a token restricted to the requester's address; a container lives as long as its token. See `sandbox/README.md`.
 
 Cargo workspace layout:
 
@@ -24,6 +26,8 @@ crates/
 ├── bastion/   # binary `biscuit-ssh-bastion`: token-checked SSH relay (russh)
 └── cli/       # binary `biscuit-ssh`: login, ssh (direct or through the bastion), token attenuation/inspection, admin
 tests/e2e.sh   # end-to-end scenarios against a real deployment
+sandbox/       # separate Cargo workspace (own Cargo.lock and target): the sandbox service and its e2e tests
+CHANGELOG.md   # user-facing changes; unreleased ones under "Unreleased"
 ```
 
 ### Authorization model
@@ -40,6 +44,15 @@ A certificate is derived from an `Authorization` only, which embeds the request 
 - Handler callbacks wrap their waits in `access::until_cut`, and relay tasks watch the cut flag; what they may still be blocked on ends when the cut closes the client and target sockets themselves, after a short graceful window. Closing sockets is the guarantee, since russh sessions run in background tasks that a stalled peer could keep alive.
 - The token reaches the bastion in parts (`core::bastion_login`): OpenSSH caps each keyboard-interactive answer at 1023 bytes, below attenuated tokens.
 - russh uses `ssh-key` 0.7 while the CA uses 0.6: keys and certificates cross over in OpenSSH text format, in `target.rs` only.
+- The target kind (server or container) is resolved before the token is checked, and selects the root key and revocation list: never fall back from one kind to the other. Containers are then addressed by their immutable ID.
+- Container sessions (`container.rs`): one `exec` per channel; with a terminal, client EOF is ignored (Docker would hang the terminal up), as sshd does. Docker cannot stop an exec: only removing the container stops its commands.
+
+### Sandbox invariants
+
+- `state.json` is the single source of truth, written atomically (and the revocation list, a projection of it, rewritten after each change) before any effect relying on it; one instance per state directory (file lock).
+- Lifecycle: `Creating` (persisted before pulling) → `Active` → `Deleting`; startup undoes `Creating` and completes `Deleting`; the reaper removes expired sandboxes, containers of this instance the state does not know, and forgets vanished ones. Containers are acted on by ID; names are only looked up with the instance label.
+- Tokens expire at `expires_at - 1` (Biscuit expirations are inclusive), containers are removed from `expires_at`.
+- Every request from a non-allowed address gets the same 401 before its body is read; errors never carry Docker's messages; tokens appear only in create/renew responses, never in logs or listings.
 
 ## Constraints
 
@@ -50,7 +63,7 @@ A certificate is derived from an `Authorization` only, which embeds the request 
   - Every public item has a doc comment explaining what it is for and any non-obvious behavior (errors, security implications, invariants).
   - Comments explain *why*, not *what*; add them where they help a reader (security reasoning, protocol quirks, non-obvious choices), and nowhere else.
   - Each crate has a crate-level doc (`//!`) describing its role. `README.md` covers usage and deployment, this file covers development.
-  - Keep docs in sync with code in the same change.
+  - Keep docs in sync with code in the same change, and record user-facing changes in `CHANGELOG.md` (under "Unreleased" until a release).
 
 ## Security rules
 
@@ -69,8 +82,9 @@ Before considering a change done:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+(cd sandbox && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test)
 ```
 
 Security-sensitive code (authorization, signing, parsing untrusted input) needs tests covering both accepted and rejected cases.
 
-Changes affecting what reaches `sshd` must also pass `tests/e2e.sh` against a test deployment (see its header). Run tests against a dedicated `sshd` instance, never the one you use to administer the test server.
+Changes affecting what reaches `sshd` must also pass `tests/e2e.sh` against a test deployment, and changes to the sandbox or to container sessions `sandbox/tests/e2e.sh` (see their headers). Run tests against a dedicated `sshd` instance, never the one you use to administer the test server, and never commit the addresses, host names or paths of a real deployment.

@@ -3,9 +3,12 @@
 # sshd trusts its CA. Run from the repository root:
 #
 #   E2E_HOST=203.0.113.10 E2E_ADMIN=admin@test-server E2E_ROOT_KEY=root.key \
-#   E2E_ISSUER_CA=issuer-ca.crt E2E_SERVER=web-1 E2E_SSH_PORT=22 \
+#   E2E_ISSUER_CA=issuer-ca.crt E2E_SERVER=web-1 E2E_SSH_PORT=2222 \
 #   E2E_USER=deploy E2E_OTHER_USER=other E2E_REVOKED=/etc/biscuit-ssh/revoked \
-#   E2E_SSHD_UNIT=ssh tests/e2e.sh
+#   E2E_SSHD_UNIT=sshd-e2e tests/e2e.sh
+#
+# E2E_SSH_PORT and E2E_SSHD_UNIT designate an sshd dedicated to these tests,
+# never the one used to administer the server.
 #
 # The server needs two accounts, E2E_USER and E2E_OTHER_USER, whose principals
 # files list `E2E_SERVER:<account>`. E2E_ADMIN is an SSH destination with sudo

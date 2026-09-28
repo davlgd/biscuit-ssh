@@ -234,6 +234,22 @@ host_key = "ssh-ed25519 AAAA..."   # that server's host public key: any other is
 
 Optional settings: `session_check_interval = 30` (seconds between token re-evaluations, 5 to 600), `clock_skew`, `policy`, and per target `source_address`, the bastion's address as the server sees it when network address translation hides the local one (the bastion's certificates are pinned to it). Run `biscuit-ssh-bastion --config /etc/biscuit-ssh/bastion.toml` like the issuer, with its own unit. It logs its host key fingerprint at startup: give it to token holders.
 
+#### Containers (unreleased)
+
+The bastion can also reach Docker containers, which need no SSH server: sessions run as `docker exec` in the container, as the login account, with `bash` or `sh`. This is what the [sandbox service](sandbox/README.md) relies on.
+
+```toml
+[containers]
+root_public_key = "ed25519/..."                       # a root key of its own
+revocation_list = "/var/lib/biscuit-ssh-sandbox/revoked"
+label = "biscuit-ssh.sandbox"
+# socket = "/var/run/docker.sock"
+```
+
+A server name that is not a configured `[targets.…]` reaches the running container of that exact name, if it carries `label`. Tokens for containers are checked with their own root key and revocation list, and tokens for servers with the main ones only: a token signed by one key never reaches the other kind of target. Containers need a Linux image with `/bin/sh`; sessions have no subsystems (no `sftp`), and a cut stops relaying but not the commands already running, until the container is removed.
+
+Access to the Docker socket is equivalent to root on the host: give it to the bastion (e.g. `SupplementaryGroups=docker`) only where containers are wanted.
+
 ### Revocation
 
 The revocation list is a text file with one revocation identifier per line (hex, from `biscuit-ssh token inspect`, or the key ID `sshd` logs for a certificate, which is the token's last block); blank lines and lines starting with `#` are ignored. Revoking needs `revocation_list` to be set beforehand; the issuer and the bastion can share one file. Each re-reads it on every check, and refuses everything while it is unreadable. Once an identifier is added:
