@@ -10,7 +10,7 @@ client ── ssh + token ──────────────────
                                                      └──────▶ container (docker exec)
 ```
 
-Unreleased: this relies on the bastion's container support, to be released with biscuit-ssh 0.3.0. The [biscuit-ssh client](../README.md#for-token-holders) of any version connects.
+Unreleased: this relies on the bastion's container support, to be released with biscuit-ssh 0.3.0. Clients connect with the [biscuit-ssh client](../README.md#for-token-holders) 0.2.0 or later.
 
 ## Quick start
 
@@ -20,28 +20,31 @@ You need `curl`, `jq`, the `biscuit-ssh` client, and an SSH key (any key: the ba
 API=https://sandbox.example.com:8444/v1/sandboxes
 ssh-keygen -q -t ed25519 -N '' -f sandbox_key                     # once
 
-# Create: may take minutes while the image is pulled, keep curl's timeout long.
-curl -sS "$API" -d '{"image": "python:3.13-slim"}' > sandbox.json
+# Create, for 10 minutes: may take minutes while the image is pulled, keep curl's timeout long.
+curl -sS "$API" -d '{"image": "python:3.13-slim", "ttl": 600}' > sandbox.json
 NAME=$(jq -r .name sandbox.json)
 jq -r .token sandbox.json > "$NAME.token"
 jq -r .bastion_known_hosts sandbox.json > known_hosts          # trusts the bastion, no prompt
 
-# Run commands (or nothing, for a shell), as many times as needed.
-$(jq -r .command sandbox.json) -i sandbox_key -o UserKnownHostsFile=known_hosts 'python3 --version'
+# Run commands, as many times as needed (without a command and </dev/null: a shell).
+biscuit-ssh ssh --bastion "$(jq -r .bastion sandbox.json)" -t "$NAME.token" -i sandbox_key \
+    "$(jq -r .login sandbox.json)" -4 -o UserKnownHostsFile=known_hosts -o ConnectTimeout=15 \
+    'python3 --version' </dev/null
+echo 'print(6 * 7)' | biscuit-ssh ssh … 'python3 -'          # same options, script on stdin
 
 # Done: remove it now rather than at expiry.
 curl -sS -X DELETE "$API/$NAME"
 ```
 
-`command` is `biscuit-ssh ssh --bastion <bastion> -t <name>.token root@<name> -4`: the token only accepts the address it was requested from (`client_ip`), so `-4` (or `-6`) keeps the connection on that address's family. Without `-i`, the client uses your default SSH key. The main README covers [scripts and agents](../README.md#from-scripts-and-agents) (no terminal, no prompts) and [troubleshooting](../README.md#troubleshooting) connections.
+The response's `command`, `biscuit-ssh ssh --bastion <bastion> -t <name>.token root@<name> -4`, is the same for pasting, from the directory holding the token file. The token only accepts the address it was requested from (`client_ip`): `-4` (or `-6`) keeps the connection on that address's family. Without `-i`, the client uses your default SSH key. The main README covers [scripts and agents](../README.md#from-scripts-and-agents) (no terminal, no prompts) and [troubleshooting](../README.md#troubleshooting) connections.
 
 ## What a sandbox is
 
 - **A Linux container of the image, running as `root`**, with `bash` if the image has it, `sh` otherwise. There is no `sftp`: copy files through a session (`cat file | … 'cat > file'`).
 - **No network but loopback.** Package managers (`apk`, `apt`, `pip`) fail, with DNS errors: use an image that already has your tools.
 - **Bounded**: memory (without swap), CPU and processes, as configured, logs capped at 1 MB. Commands run with no privilege escalation (`no-new-privileges`) and only the capabilities `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID` and `SETUID`: files and processes of its own, no raw sockets, devices, mounts or `chroot`.
-- **Its life is its token's.** A token lasts `ttl` seconds (60 to one hour, one hour by default) from its creation or renewal. When it expires, or on `DELETE`, the container is removed with everything in it; the service checks every 10 seconds, and retries while Docker fails.
-- **Renewing** gives a new token valid `ttl` from now, never shortening the sandbox's life: renewing before each expiry keeps a sandbox indefinitely. The previous token is revoked at once: sessions opened with it are cut by the bastion at its next check (30 seconds by default), and new ones need the new token. Commands already started keep running; only removing the container stops them.
+- **Its life is its token's.** A token lasts `ttl` seconds (60 to one hour, one hour by default, as configured) from its creation or renewal. When it expires, or on `DELETE`, the container is removed with everything in it; the service checks every 10 seconds, and retries while Docker fails.
+- **Renewing** gives a new token valid `ttl` from now (one hour by default, without a body), never shortening the sandbox's life: renewing before each expiry keeps a sandbox indefinitely. The previous token is revoked at once: sessions opened with it are cut at the bastion's next check, within its check interval (30 seconds by default), and new ones need the new token. Commands already started keep running; only removing the container stops them.
 - **Shared by allowed addresses**: any client allowed to use the API can list, renew and delete every sandbox. Keep the `name` of yours.
 
 ## API
@@ -50,10 +53,11 @@ Requests only succeed from allowed addresses; any other one gets `401 {"error": 
 
 | Request | Answer |
 |---|---|
-| `POST /v1/sandboxes` `{"image": "...", "ttl": 3600}` | `201`, see below. `ttl` is optional. |
+| `POST /v1/sandboxes` `{"image": "...", "ttl": 3600}` | `201`, see below. `ttl` is optional, in seconds. |
 | `POST /v1/sandboxes/{name}/renew` `{"ttl": 3600}` (body optional) | `200`, as for a creation, with a new token for the calling address. `409` if it would shorten the sandbox's life. |
 | `DELETE /v1/sandboxes/{name}` | `204`: the token is revoked, the container removed, open sessions end. |
 | `GET /v1/sandboxes` | `200`, `[{"name", "image", "status", "expires_at", "client_ip"}]`, never tokens. |
+| `GET /v1/sandboxes/{name}` | `200`, one of them; `404` once it is gone. |
 
 ```json
 {

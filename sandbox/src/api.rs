@@ -6,7 +6,8 @@
 //!   200, a new [`LeaseResponse`], the previous token being revoked;
 //! - `DELETE /v1/sandboxes/{name}` → 204, the token revoked and the
 //!   container removed;
-//! - `GET /v1/sandboxes` → 200, the sandboxes, without tokens.
+//! - `GET /v1/sandboxes` → 200, the sandboxes, without tokens;
+//! - `GET /v1/sandboxes/{name}` → 200, one of them.
 //!
 //! Only allowed client addresses may call it: any other request, whatever
 //! it is, gets `401 {"error": "authentication failed"}` before its body is
@@ -21,14 +22,14 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::image::ImageRef;
 use crate::lifecycle::{Failure, Lease, Sandboxes};
-use crate::state::Status;
+use crate::state::{Sandbox, Status};
 
 /// Largest request body accepted.
 const MAX_BODY: usize = 4 * 1024;
@@ -40,15 +41,15 @@ struct CreateRequest {
     /// Docker Hub image, e.g. `alpine:3.20`.
     image: String,
     /// Lifetime in seconds, at most the configured one (the default).
-    ttl: Option<u64>,
+    ttl: Option<serde_json::Value>,
 }
 
 /// Body of `POST /v1/sandboxes/{name}/renew`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenewRequest {
-    /// Lifetime in seconds from now.
-    ttl: Option<u64>,
+    /// Lifetime in seconds from now, the configured one by default.
+    ttl: Option<serde_json::Value>,
 }
 
 /// A sandbox and how to reach it. Contains the token: never cached.
@@ -93,7 +94,7 @@ struct ErrorBody {
 pub fn router(sandboxes: Arc<Sandboxes>) -> Router {
     Router::new()
         .route("/v1/sandboxes", post(create).get(list))
-        .route("/v1/sandboxes/{name}", axum::routing::delete(delete))
+        .route("/v1/sandboxes/{name}", get(show).delete(delete))
         .route("/v1/sandboxes/{name}/renew", post(renew))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
         .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed") })
@@ -161,8 +162,12 @@ async fn create(
         Ok(image) => image,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("invalid image reference: {e}")),
     };
+    let ttl = match ttl(&sandboxes, body.ttl) {
+        Ok(ttl) => ttl,
+        Err(failure) => return failure_response(&failure),
+    };
     let client = peer.ip().to_canonical();
-    match sandboxes.create(&image, body.ttl, client).await {
+    match sandboxes.create(&image, ttl, client).await {
         Ok(lease) => (StatusCode::CREATED, Json(lease_response(&sandboxes, lease))).into_response(),
         Err(failure) => failure_response(&failure),
     }
@@ -178,6 +183,10 @@ async fn renew(
         Ok(body) => body,
         Err((status, message)) => return error(status, &message),
     };
+    let ttl = match self::ttl(&sandboxes, ttl) {
+        Ok(ttl) => ttl,
+        Err(failure) => return failure_response(&failure),
+    };
     match sandboxes.renew(&name, ttl, peer.ip().to_canonical()).await {
         Ok(lease) => Json(lease_response(&sandboxes, lease)).into_response(),
         Err(failure) => failure_response(&failure),
@@ -192,19 +201,33 @@ async fn delete(State(sandboxes): State<Arc<Sandboxes>>, Path(name): Path<String
 }
 
 async fn list(State(sandboxes): State<Arc<Sandboxes>>) -> Response {
-    let summaries: Vec<Summary> = sandboxes
-        .list()
-        .await
-        .into_iter()
-        .map(|(name, sandbox)| Summary {
-            name,
-            image: sandbox.image,
-            status: sandbox.status,
-            expires_at: (sandbox.status != Status::Creating).then_some(sandbox.expires_at),
-            client_ip: sandbox.client,
-        })
-        .collect();
+    let summaries: Vec<Summary> = sandboxes.list().await.into_iter().map(summary).collect();
     Json(summaries).into_response()
+}
+
+async fn show(State(sandboxes): State<Arc<Sandboxes>>, Path(name): Path<String>) -> Response {
+    match sandboxes.list().await.into_iter().find(|(n, _)| *n == name) {
+        Some(sandbox) => Json(summary(sandbox)).into_response(),
+        None => failure_response(&Failure::NotFound),
+    }
+}
+
+fn summary((name, sandbox): (String, Sandbox)) -> Summary {
+    Summary {
+        name,
+        image: sandbox.image,
+        status: sandbox.status,
+        expires_at: (sandbox.status != Status::Creating).then_some(sandbox.expires_at),
+        client_ip: sandbox.client,
+    }
+}
+
+/// A requested lifetime, which must be a whole number of seconds; its
+/// bounds are checked with the sandbox.
+fn ttl(sandboxes: &Sandboxes, requested: Option<serde_json::Value>) -> Result<Option<u64>, Failure> {
+    requested
+        .map(|ttl| ttl.as_u64().ok_or(Failure::Ttl(sandboxes.settings().lifetime)))
+        .transpose()
 }
 
 fn lease_response(sandboxes: &Sandboxes, lease: Lease) -> LeaseResponse {

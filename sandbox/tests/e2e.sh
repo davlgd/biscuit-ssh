@@ -109,7 +109,8 @@ check "uppercase image → 400, saying so" \
 api POST /v1/sandboxes '{"image":"alpine","ttl":30}'
 check "ttl out of bounds → 400" '[[ $code == 400 ]]' "$code"
 api POST /v1/sandboxes '{"image":"alpine","ttl":"1h"}'
-check "ttl not a number → 400, saying so" '[[ $code == 400 && $(cat body) == *"invalid type"* ]]' "$code $(cat body)"
+check "ttl not a number → 400, saying so" '[[ $code == 400 && $(cat body) == *"whole number of seconds"* ]]' \
+    "$code $(cat body)"
 python3 -c "print('{\"image\":\"' + 'a' * 4100 + '\"}')" >big.json
 code=$("${CURL[@]}" -X POST --data-binary @big.json -o body -w '%{http_code}' "$E2E_API/v1/sandboxes")
 check "body too large → 413, in JSON" '[[ $code == 413 ]] && error_is "request too large"' "$code $(cat body)"
@@ -127,6 +128,8 @@ create alpine:3.20 || die "cannot create a sandbox: $code $(cat body)"
 first=$name
 check "response: command reads <name>.token" '[[ $(field command) == *" -t $first.token root@$first "* ]]' \
     "$(field command)"
+api GET "/v1/sandboxes/$first"
+check "get one sandbox → 200, active" '[[ $code == 200 && $(field status) == Active ]]' "$code $(cat body)"
 out=$(via "token.$first" "root@$first" 'echo out; echo err >&2; exit 42' 2>err)
 status=$?
 check "session: stdout, stderr, exit status" '[[ $out == out && $(<err) == err && $status == 42 ]]' "$out/$(<err)/$status"
@@ -184,6 +187,8 @@ out=$(via "token.$first" "root@$first" true 2>&1)
 check "deleted sandbox refuses its token" '[[ $out == *"access refused"* ]]' "$out"
 api DELETE "/v1/sandboxes/$first"
 check "delete again → 404" '[[ $code == 404 ]]' "$code"
+api GET "/v1/sandboxes/$first"
+check "get a deleted sandbox → 404" '[[ $code == 404 ]]' "$code"
 
 create alpine:3.20 60 || die "cannot create a short sandbox: $code $(cat body)"
 short=$name

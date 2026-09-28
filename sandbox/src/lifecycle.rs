@@ -19,7 +19,7 @@ use bollard::Docker;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Settings;
-use crate::docker::{self, PullError};
+use crate::docker::{self, PullError, Unusable};
 use crate::image::ImageRef;
 use crate::state::{Sandbox, Status, Store};
 
@@ -45,7 +45,7 @@ pub enum Failure {
     #[error("too many sandboxes, retry later")]
     TooMany,
     /// The requested lifetime is out of bounds.
-    #[error("ttl must be between 60 and {0} seconds")]
+    #[error("ttl must be a whole number of seconds, from 60 to {0}")]
     Ttl(u64),
     /// The image does not exist on Docker Hub.
     #[error("image not found")]
@@ -221,7 +221,10 @@ impl Sandboxes {
             Ok(Ok((container, Ok(())))) => Ok((container, image_id)),
             Ok(Ok((container, Err(unusable)))) => {
                 let _ = docker::remove(&self.docker, &container).await;
-                Err(Failure::ImageUnusable(unusable.reason()))
+                Err(match unusable {
+                    Unusable::Unchecked => Failure::Unavailable,
+                    unusable => Failure::ImageUnusable(unusable.reason()),
+                })
             }
             Ok(Err(e)) => {
                 tracing::warn!(%name, error = %e, "cannot run the container");

@@ -170,6 +170,8 @@ pub enum Unusable {
     Exited,
     /// `/bin/sh` does not run in it.
     NoShell,
+    /// Docker could not tell: not the image's fault.
+    Unchecked,
 }
 
 impl Unusable {
@@ -178,6 +180,7 @@ impl Unusable {
         match self {
             Self::Exited => "its command exits at once (it must keep running, like a shell)",
             Self::NoShell => "/bin/sh does not run in it",
+            Self::Unchecked => "Docker could not check it",
         }
     }
 }
@@ -187,14 +190,11 @@ impl Unusable {
 pub async fn usable(docker: &Docker, id: &str, user: &str) -> Result<(), Unusable> {
     // A command that exits at once would be caught here.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let running = docker
+    let inspected = docker
         .inspect_container(id, None::<InspectContainerOptions>)
         .await
-        .ok()
-        .and_then(|inspected| inspected.state)
-        .and_then(|state| state.running)
-        == Some(true);
-    if !running {
+        .map_err(|_| Unusable::Unchecked)?;
+    if inspected.state.and_then(|state| state.running) != Some(true) {
         return Err(Unusable::Exited);
     }
     match tokio::time::timeout(SHELL_TIMEOUT, shell_works(docker, id, user)).await {
