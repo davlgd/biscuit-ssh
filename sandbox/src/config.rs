@@ -28,6 +28,8 @@
 //! cpus = 1.0
 //! pids = 256
 //! pull_timeout = 300             # seconds
+//! # disk_mb = 2048               # writable layer size; needs overlay2 on XFS
+//! #                              # with project quotas, unbounded otherwise
 //!
 //! [tls]
 //! certificate = "/etc/biscuit-ssh/tls.crt"
@@ -94,6 +96,7 @@ struct LimitsConfig {
     cpus: f64,
     pids: i64,
     pull_timeout: u64,
+    disk_mb: Option<u64>,
 }
 
 impl Default for LimitsConfig {
@@ -106,6 +109,7 @@ impl Default for LimitsConfig {
             cpus: 1.0,
             pids: 256,
             pull_timeout: 300,
+            disk_mb: None,
         }
     }
 }
@@ -199,6 +203,7 @@ impl Config {
                 // Whole billionths of a CPU; the fraction is dropped on purpose.
                 nano_cpus: (limits.cpus * 1e9) as i64,
                 pids: limits.pids,
+                disk: limits.disk_mb.map(|mb| format!("{mb}M")),
             },
             pull_timeout: Duration::from_secs(limits.pull_timeout),
         })

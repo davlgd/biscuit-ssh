@@ -26,8 +26,8 @@ use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, 
 use tokio::sync::{Semaphore, oneshot, watch};
 use tracing::Instrument;
 
-use crate::access::Target;
 use crate::access::{self, Cutter, Grant, until_cut};
+use crate::access::{Kind, Target};
 use crate::config::Settings;
 use crate::container::{self, ContainerChannel, Output};
 use crate::relay::{self, Relay, Replies};
@@ -145,29 +145,56 @@ impl Connection {
             .rsplit_once('@')
             .and_then(|(user, server)| Some((user.parse::<Name>().ok()?, server.parse::<Name>().ok()?)))
             .ok_or(Refused::new("invalid_login", anyhow!("invalid login")))?;
-        let permit = Arc::clone(&self.admission)
-            .try_acquire_owned()
-            .map_err(|_| Refused::new("busy", anyhow!("too many logins")))?;
-        let target = self.resolve(&server).await?;
+        // Unknown names are reported as mere denials, so clients cannot
+        // enumerate targets.
+        let unknown = || Refused::new("denied", anyhow!("unknown server {server}"));
+        let kind = match (self.settings.servers.contains_key(&server), &self.settings.containers) {
+            (true, _) => Kind::Server,
+            (false, Some(_)) => Kind::Container,
+            (false, None) => return Err(unknown()),
+        };
         let request = AccessRequest {
             time: SystemTime::now(),
             source_ip: self.peer,
-            server,
+            server: server.clone(),
             user,
             command: None,
             public_key: fingerprint,
             mode: Mode::Bastion,
         };
-        let grant = Arc::new(Grant { token, request, target });
-        let (settings, checked) = (Arc::clone(&self.settings), Arc::clone(&grant));
+
+        // The token is checked before any Docker request: invalid tokens
+        // cost no more than for servers.
+        let permit = Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| Refused::new("busy", anyhow!("too many logins")))?;
+        let (settings, checked) = (Arc::clone(&self.settings), (token.clone(), request.clone()));
         let authorization = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            checked.authorize(&settings, checked.request.time, settings.check_interval)
+            let (token, request) = checked;
+            access::authorize(&settings, kind, &token, &request, settings.check_interval)
         })
         .await
         .map_err(|e| Refused::new("internal", e.into()))?
-        .map_err(|refusal| Refused::new(refusal.kind(), anyhow!("token refused")))?;
+        .map_err(|refusal| match (kind, refusal.kind()) {
+            // A name that is no server is checked as a container: a token for
+            // servers then fails there, and must look like any unknown name.
+            (Kind::Container, "invalid_token") => unknown(),
+            (_, kind) => Refused::new(kind, anyhow!("token refused")),
+        })?;
 
+        let target = match kind {
+            Kind::Server => Target::Server(self.settings.servers.get(&server).ok_or_else(unknown)?.clone()),
+            Kind::Container => {
+                let containers = self.settings.containers.as_ref().ok_or_else(unknown)?;
+                match container::find(containers, &server).await {
+                    Ok(Some(id)) => Target::Container(id),
+                    Ok(None) => return Err(unknown()),
+                    Err(e) => return Err(Refused::new("internal", e)),
+                }
+            }
+        };
+        let grant = Arc::new(Grant { token, request, target });
         self.span.record("server", grant.request.server.as_str());
         tracing::info!(
             parent: &self.span,
@@ -178,22 +205,6 @@ impl Connection {
         );
         self.grant = Some((grant, authorization.valid_until()));
         Ok(())
-    }
-
-    /// Where sessions for `server` go: a configured server, else a labelled
-    /// running container of that name. Unknown names are reported as mere
-    /// denials, so clients cannot enumerate targets.
-    async fn resolve(&self, server: &Name) -> Result<Target, Refused> {
-        if let Some(server) = self.settings.servers.get(server) {
-            return Ok(Target::Server(server.clone()));
-        }
-        let unknown = || Refused::new("denied", anyhow!("unknown server {server}"));
-        let containers = self.settings.containers.as_ref().ok_or_else(unknown)?;
-        match container::find(containers, server).await {
-            Ok(Some(id)) => Ok(Target::Container(id)),
-            Ok(None) => Err(unknown()),
-            Err(e) => Err(Refused::new("internal", e)),
-        }
     }
 
     /// Logs a refused login and tells the client why. SSH has no refusal

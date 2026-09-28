@@ -11,6 +11,7 @@
 //! the container is removed.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use biscuit_ssh_core::Name;
@@ -21,6 +22,7 @@ use futures_util::StreamExt;
 use russh::ChannelId;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 
 use crate::config::Containers;
 
@@ -70,6 +72,17 @@ struct Exec {
     /// `None` once the client sent EOF. In a mutex only to make sessions
     /// shareable between threads, as russh requires; it is never contended.
     input: Option<Mutex<Input>>,
+    /// Relays the output; stopped when the channel goes, which closes the
+    /// connection to Docker (the command itself keeps running).
+    pump: JoinHandle<()>,
+}
+
+impl Drop for ContainerChannel {
+    fn drop(&mut self) {
+        if let Some(exec) = &self.exec {
+            exec.pump.abort();
+        }
+    }
 }
 
 type Input = Pin<Box<dyn AsyncWrite + Send>>;
@@ -146,10 +159,11 @@ impl ContainerChannel {
             // Best effort: a failed resize leaves the default size.
             let _ = resize(docker, &created.id, pty.width, pty.height).await;
         }
-        tokio::spawn(pump(docker.clone(), created.id.clone(), stream, output));
+        let pump = tokio::spawn(pump(docker.clone(), created.id.clone(), stream, output));
         self.exec = Some(Exec {
             id: created.id,
             input: Some(Mutex::new(input)),
+            pump,
         });
         Ok(())
     }
@@ -202,44 +216,65 @@ async fn resize(docker: &Docker, exec: &str, width: u16, height: u16) -> anyhow:
 }
 
 /// Relays a command's output to the client, then its exit status, and
-/// closes the channel.
-async fn pump(
-    docker: Docker,
-    exec: String,
-    mut stream: Pin<Box<dyn futures_util::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
-    output: Output,
-) {
+/// closes the channel; stops at once when the connection is cut.
+async fn pump(docker: Docker, exec: String, stream: OutputStream, output: Output) {
     let Output {
         client,
         channel,
         mut cut,
     } = output;
-    let channel = &channel;
-    loop {
-        let item = tokio::select! {
-            biased;
-            _ = cut.wait_for(|cut| *cut) => return,
-            item = stream.next() => item,
-        };
-        let delivered = match item {
+    tokio::select! {
+        biased;
+        _ = cut.wait_for(|cut| *cut) => {}
+        () = relay(&docker, &exec, stream, &client, channel) => {}
+    }
+}
+
+type OutputStream = Pin<Box<dyn futures_util::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
+
+async fn relay(
+    docker: &Docker,
+    exec: &str,
+    mut stream: OutputStream,
+    client: &russh::server::Handle,
+    channel: ChannelId,
+) {
+    let ended = loop {
+        let delivered = match stream.next().await {
             Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
-                client.data(*channel, message).await.is_ok()
+                client.data(channel, message).await.is_ok()
             }
-            Some(Ok(LogOutput::StdErr { message })) => client.extended_data(*channel, 1, message).await.is_ok(),
+            Some(Ok(LogOutput::StdErr { message })) => client.extended_data(channel, 1, message).await.is_ok(),
             Some(Ok(LogOutput::StdIn { .. })) => true,
-            Some(Err(_)) | None => break,
+            // A broken stream says nothing about how the command ended.
+            Some(Err(_)) => break false,
+            None => break true,
         };
         if !delivered {
             return;
         }
-    }
-    let status = match docker.inspect_exec(&exec).await {
-        Ok(inspected) => inspected.exit_code.and_then(|code| u32::try_from(code).ok()),
-        Err(_) => None,
     };
+    let status = match ended {
+        true => exit_status(docker, exec).await,
+        false => None,
+    };
+    // Without a status, the client knows the command's outcome is unknown.
     if let Some(status) = status {
-        let _ = client.exit_status_request(*channel, status).await;
+        let _ = client.exit_status_request(channel, status).await;
     }
-    let _ = client.eof(*channel).await;
-    let _ = client.close(*channel).await;
+    let _ = client.eof(channel).await;
+    let _ = client.close(channel).await;
+}
+
+/// The exit status of a command whose output ended, once Docker confirms it
+/// is no longer running; `None` if it does not within a few seconds.
+async fn exit_status(docker: &Docker, exec: &str) -> Option<u32> {
+    for _ in 0..25 {
+        let inspected = docker.inspect_exec(exec).await.ok()?;
+        if inspected.running == Some(false) {
+            return inspected.exit_code.and_then(|code| u32::try_from(code).ok());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
 }

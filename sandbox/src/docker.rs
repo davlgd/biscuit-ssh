@@ -30,6 +30,9 @@ pub struct Limits {
     pub nano_cpus: i64,
     /// Processes.
     pub pids: i64,
+    /// Writable layer size, e.g. `2G`, when Docker's storage supports it
+    /// (overlay2 on XFS with project quotas).
+    pub disk: Option<String>,
 }
 
 /// Why an image cannot be pulled.
@@ -120,6 +123,10 @@ pub async fn run(
             nano_cpus: Some(limits.nano_cpus),
             pids_limit: Some(limits.pids),
             security_opt: Some(vec!["no-new-privileges".to_owned()]),
+            storage_opt: limits
+                .disk
+                .clone()
+                .map(|size| HashMap::from([("size".to_owned(), size)])),
             log_config: Some(HostConfigLogConfig {
                 typ: Some("json-file".to_owned()),
                 config: Some(HashMap::from([
@@ -196,6 +203,15 @@ pub async fn remove(docker: &Docker, id: &str) -> anyhow::Result<()> {
     match docker.remove_container(id, Some(options)).await {
         Ok(()) | Err(DockerError::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
         Err(e) => Err(e).context("cannot remove the container"),
+    }
+}
+
+/// Whether container `id` exists; `Err` when Docker cannot tell.
+pub async fn exists(docker: &Docker, id: &str) -> Result<bool, ()> {
+    match docker.inspect_container(id, None::<InspectContainerOptions>).await {
+        Ok(_) => Ok(true),
+        Err(DockerError::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+        Err(_) => Err(()),
     }
 }
 

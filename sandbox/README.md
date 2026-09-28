@@ -55,7 +55,7 @@ Images come from Docker Hub only (`alpine`, `alpine:3.20`, `bitnami/redis`, with
 - Bounded memory (without swap), CPU and processes, logs capped at 1 MB, no privilege escalation (`no-new-privileges`).
 - One hour at most; removed within 10 seconds of its token's expiry or revocation, while the service runs. After a restart, the service first finishes what it left: interrupted creations are undone, pending deletions completed, and containers of its own it does not know removed. It never touches other containers.
 
-Not bounded: the disk used by images and by writes inside containers.
+Not bounded by default: the disk used by images and by writes inside containers. Give Docker a filesystem of its own (its `data-root`) so a sandbox cannot fill the host's, and, where Docker's storage supports it (overlay2 on XFS with project quotas), set `limits.disk_mb` to cap each container's writes.
 
 ## Running it
 
@@ -89,7 +89,7 @@ certificate = "/etc/biscuit-ssh/tls.crt"
 key = "/etc/biscuit-ssh/tls.key"
 ```
 
-Optional settings, with their defaults: `label = "biscuit-ssh.sandbox"` (the bastion's `[containers] label`), `account = "root"`, `socket = "/var/run/docker.sock"`, and under `[limits]`: `lifetime = 3600`, `max_sandboxes = 5`, `max_creations = 2`, `memory_mb = 512`, `cpus = 1.0`, `pids = 256`, `pull_timeout = 300`.
+Optional settings, with their defaults: `label = "biscuit-ssh.sandbox"` (the bastion's `[containers] label`), `account = "root"`, `socket = "/var/run/docker.sock"`, and under `[limits]`: `lifetime = 3600`, `max_sandboxes = 5`, `max_creations = 2`, `memory_mb = 512`, `cpus = 1.0`, `pids = 256`, `pull_timeout = 300`, and `disk_mb` (unset: see above).
 
 The bastion side (see [Containers](../README.md#containers-unreleased)):
 

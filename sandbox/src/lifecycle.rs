@@ -316,14 +316,14 @@ impl Sandboxes {
         let now = now();
         let pending = {
             let mut store = self.store.lock().await;
-            let mut changed = false;
             for sandbox in store.state.sandboxes.values_mut() {
                 if sandbox.status == Status::Active && sandbox.expires_at <= now {
                     sandbox.status = Status::Deleting;
-                    changed = true;
                 }
             }
-            if changed && save(&mut store).is_err() {
+            // Saved on every pass, even unchanged: this also republishes the
+            // revocation list if a previous write of it failed.
+            if save(&mut store).is_err() {
                 return;
             }
             store
@@ -341,47 +341,49 @@ impl Sandboxes {
     }
 
     /// Reconciles Docker with the state, outside `Creating` sandboxes: stray
-    /// containers are removed, sandboxes without container deleted.
+    /// containers are removed, sandboxes whose container vanished deleted.
     async fn reap_strays(&self) {
         let instance = self.store.lock().await.state.instance.clone();
         let Ok(containers) = docker::list(&self.docker, &self.settings.label, &instance).await else {
             return;
         };
-        let mut store = self.store.lock().await;
-        let known = |id: &str| {
-            store
-                .state
-                .sandboxes
-                .values()
-                .any(|s| s.container.as_deref() == Some(id))
+        let (strays, missing) = {
+            let store = self.store.lock().await;
+            let sandboxes = &store.state.sandboxes;
+            let known = |id: &str| sandboxes.values().any(|s| s.container.as_deref() == Some(id));
+            let creating = |name: &str| sandboxes.get(name).is_some_and(|s| s.status == Status::Creating);
+            let strays: Vec<String> = containers
+                .iter()
+                .filter(|(id, name)| !known(id) && !creating(name))
+                .map(|(id, _)| id.clone())
+                .collect();
+            // Absent from a listing that may predate them: checked again below.
+            let listed = |id: &String| containers.iter().any(|(c, _)| c == id);
+            let missing: Vec<(String, String)> = sandboxes
+                .iter()
+                .filter(|(_, s)| s.status == Status::Active)
+                .filter_map(|(name, s)| Some((name.clone(), s.container.clone()?)))
+                .filter(|(_, id)| !listed(id))
+                .collect();
+            (strays, missing)
         };
-        let creating = |name: &str| {
-            store
-                .state
-                .sandboxes
-                .get(name)
-                .is_some_and(|s| s.status == Status::Creating)
-        };
-        let strays: Vec<String> = containers
-            .iter()
-            .filter(|(id, name)| !known(id) && !creating(name))
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut vanished = false;
-        for sandbox in store.state.sandboxes.values_mut() {
-            let exists = |id: &String| containers.iter().any(|(c, _)| c == id);
-            if sandbox.status == Status::Active && sandbox.container.as_ref().is_some_and(|id| !exists(id)) {
-                sandbox.status = Status::Deleting;
-                vanished = true;
-            }
-        }
-        if vanished {
-            let _ = save(&mut store);
-        }
-        drop(store);
         for id in strays {
             tracing::warn!(container = %id, "removing a stray container");
             let _ = docker::remove(&self.docker, &id).await;
+        }
+        for (name, id) in missing {
+            if docker::exists(&self.docker, &id).await != Ok(false) {
+                continue;
+            }
+            let mut store = self.store.lock().await;
+            if let Some(sandbox) = store.state.sandboxes.get_mut(&name)
+                && sandbox.status == Status::Active
+                && sandbox.container.as_deref() == Some(id.as_str())
+            {
+                tracing::warn!(%name, "the container vanished");
+                sandbox.status = Status::Deleting;
+                let _ = save(&mut store);
+            }
         }
     }
 

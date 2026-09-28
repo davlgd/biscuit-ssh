@@ -64,6 +64,25 @@ impl Refusal {
     }
 }
 
+/// The kind of a target, which selects the root key and revocation list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// See [`Target::Server`].
+    Server,
+    /// See [`Target::Container`].
+    Container,
+}
+
+impl Target {
+    /// The kind of this target.
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::Server(_) => Kind::Server,
+            Self::Container(_) => Kind::Container,
+        }
+    }
+}
+
 impl Grant {
     /// Evaluates the token for `lifetime` from `time`, against the current
     /// revocation list. Blocking: Datalog.
@@ -73,27 +92,41 @@ impl Grant {
         time: SystemTime,
         lifetime: Duration,
     ) -> Result<Authorization, Refusal> {
-        // Each kind of target has its own root key and revocations, so a
-        // token for containers can never reach a server, and conversely.
-        let (verifier, revocations) = match &self.target {
-            Target::Server(_) => (&settings.authority.verifier, settings.authority.revocations()),
-            Target::Container(_) => {
-                let containers = settings.containers.as_ref().ok_or(Refusal::Immediate("internal"))?;
-                (&containers.verifier, containers.revocations.read())
-            }
-        };
-        let revoked = revocations.map_err(|_| Refusal::Immediate("revocation_list_unreadable"))?;
         let request = AccessRequest {
             time,
             ..self.request.clone()
         };
-        verifier
-            .authorize(&self.token, &request, &revoked, lifetime)
-            .map_err(|e| match e {
-                biscuit_ssh_core::Error::Denied(_) => Refusal::Denied,
-                _ => Refusal::Immediate(e.kind()),
-            })
+        authorize(settings, self.target.kind(), &self.token, &request, lifetime)
     }
+}
+
+/// Checks `token` for `request` with the root key and revocation list of
+/// `kind`. Blocking: Datalog.
+///
+/// Each kind of target has its own root key and revocations, and never
+/// falls back to the other's: a token for containers can never reach a
+/// server, and conversely.
+pub fn authorize(
+    settings: &Settings,
+    kind: Kind,
+    token: &str,
+    request: &AccessRequest,
+    lifetime: Duration,
+) -> Result<Authorization, Refusal> {
+    let (verifier, revocations) = match kind {
+        Kind::Server => (&settings.authority.verifier, settings.authority.revocations()),
+        Kind::Container => {
+            let containers = settings.containers.as_ref().ok_or(Refusal::Immediate("internal"))?;
+            (&containers.verifier, containers.revocations.read())
+        }
+    };
+    let revoked = revocations.map_err(|_| Refusal::Immediate("revocation_list_unreadable"))?;
+    verifier
+        .authorize(token, request, &revoked, lifetime)
+        .map_err(|e| match e {
+            biscuit_ssh_core::Error::Denied(_) => Refusal::Denied,
+            _ => Refusal::Immediate(e.kind()),
+        })
 }
 
 /// Keeps renewing the lease of a connection until the token stops allowing

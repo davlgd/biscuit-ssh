@@ -178,7 +178,13 @@ impl Config {
         let host_key = PrivateKey::read_openssh_file(&self.host_key)
             .with_context(|| format!("cannot load host key {}", self.host_key.display()))?;
         let containers = match &self.containers {
-            Some(containers) => Some(containers.connect().await?),
+            Some(containers) => {
+                ensure!(
+                    containers.root_public_key.trim() != self.root_public_key.trim(),
+                    "containers.root_public_key must differ from root_public_key: each kind of target needs its own key"
+                );
+                Some(containers.connect().await?)
+            }
             None => None,
         };
         Ok(Settings {
