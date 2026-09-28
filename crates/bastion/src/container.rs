@@ -269,12 +269,17 @@ async fn relay(
 /// The exit status of a command whose output ended, once Docker confirms it
 /// is no longer running; `None` if it does not within a few seconds.
 async fn exit_status(docker: &Docker, exec: &str) -> Option<u32> {
-    for _ in 0..25 {
-        let inspected = docker.inspect_exec(exec).await.ok()?;
-        if inspected.running == Some(false) {
-            return inspected.exit_code.and_then(|code| u32::try_from(code).ok());
+    let confirmed = async {
+        loop {
+            let inspected = docker.inspect_exec(exec).await.ok()?;
+            if inspected.running == Some(false) {
+                return inspected.exit_code.and_then(|code| u32::try_from(code).ok());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    None
+    };
+    tokio::time::timeout(Duration::from_secs(5), confirmed)
+        .await
+        .ok()
+        .flatten()
 }
