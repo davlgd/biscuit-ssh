@@ -1,10 +1,11 @@
 //! The Docker operations of a sandbox: pull, run, check, remove.
 //!
-//! Containers run without network (the bastion reaches them through the
-//! Docker API, not over the network), with bounded memory, CPU, processes
-//! and logs, a reduced set of capabilities, and cannot gain privileges. Every operation addresses a
-//! container by its immutable ID, except the lookup of a name left over by
-//! a crash, which is checked against this instance's label.
+//! Containers run without network but loopback (the bastion reaches them
+//! through the Docker API, not over the network), with bounded memory, CPU,
+//! processes and logs, a reduced set of capabilities, and cannot gain
+//! privileges. Every operation addresses a container by its immutable ID,
+//! except the lookup of a name left over by a crash, which is checked
+//! against this instance's label.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -162,9 +163,28 @@ pub async fn run(
     Ok(created.id)
 }
 
-/// Whether container `id` keeps running and can run `/bin/sh` as `user`,
-/// which sessions through the bastion need.
-pub async fn usable(docker: &Docker, id: &str, user: &str) -> bool {
+/// Why a container cannot be a sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unusable {
+    /// Its command ended at once.
+    Exited,
+    /// `/bin/sh` does not run in it.
+    NoShell,
+}
+
+impl Unusable {
+    /// The reason, for clients.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Exited => "its command exits at once (it must keep running, like a shell)",
+            Self::NoShell => "/bin/sh does not run in it",
+        }
+    }
+}
+
+/// Checks that container `id` keeps running and can run `/bin/sh` as
+/// `user`, which sessions through the bastion need.
+pub async fn usable(docker: &Docker, id: &str, user: &str) -> Result<(), Unusable> {
     // A command that exits at once would be caught here.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let running = docker
@@ -174,8 +194,17 @@ pub async fn usable(docker: &Docker, id: &str, user: &str) -> bool {
         .and_then(|inspected| inspected.state)
         .and_then(|state| state.running)
         == Some(true);
-    running && shell_works(docker, id, user).await.unwrap_or(false)
+    if !running {
+        return Err(Unusable::Exited);
+    }
+    match tokio::time::timeout(SHELL_TIMEOUT, shell_works(docker, id, user)).await {
+        Ok(Ok(true)) => Ok(()),
+        _ => Err(Unusable::NoShell),
+    }
 }
+
+/// Longest the `/bin/sh` check may take.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn shell_works(docker: &Docker, id: &str, user: &str) -> anyhow::Result<bool> {
     let exec = docker
@@ -203,14 +232,13 @@ async fn shell_works(docker: &Docker, id: &str, user: &str) -> anyhow::Result<bo
         }
     }
     // Only a command Docker reports as finished has a meaningful status.
-    for _ in 0..25 {
+    loop {
         let inspected = docker.inspect_exec(&exec.id).await?;
         if inspected.running == Some(false) {
             return Ok(inspected.exit_code == Some(0));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Ok(false)
 }
 
 /// Removes container `id` and its anonymous volumes, stopping it if needed.

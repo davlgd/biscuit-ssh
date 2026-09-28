@@ -10,16 +10,17 @@
 //! state_dir = "/var/lib/biscuit-ssh-sandbox"
 //! # Written by the sandbox, read by the bastion's [containers] section.
 //! revocation_list = "/var/lib/biscuit-ssh-sandbox/revoked"
-//!
-//! [bastion]
-//! address = "bastion.example.com:2200"
-//! host_key = "SHA256:..."        # its host key fingerprint, for clients
-//!
 //! # Optional, defaults shown.
 //! label = "biscuit-ssh.sandbox"  # the bastion's [containers] label
 //! account = "root"               # account sessions run as
 //! socket = "/var/run/docker.sock"
 //!
+//! [bastion]
+//! address = "bastion.example.com:2200"
+//! # Its host public key (the bastion's host key `.pub`), for clients.
+//! host_key = "ssh-ed25519 AAAA..."
+//!
+//! # Optional, defaults shown.
 //! [limits]
 //! lifetime = 3600                # longest token and sandbox life, in seconds
 //! max_sandboxes = 5
@@ -44,6 +45,7 @@ use anyhow::{Context, ensure};
 use biscuit_ssh_core::{KeyPair, Name, PrivateKey};
 use biscuit_ssh_service::http::Tls;
 use serde::Deserialize;
+use ssh_key::{HashAlg, PublicKey};
 
 use crate::docker::Limits;
 
@@ -119,8 +121,31 @@ impl Default for LimitsConfig {
 pub struct Bastion {
     /// `host:port`.
     pub address: String,
-    /// Host key fingerprint.
-    pub host_key: String,
+    /// Host key fingerprint, `SHA256:…`.
+    pub fingerprint: String,
+    /// Its `known_hosts` line.
+    pub known_hosts: String,
+}
+
+impl Bastion {
+    fn new(address: &str, host_key: &str) -> anyhow::Result<Self> {
+        let key =
+            PublicKey::from_openssh(host_key).context("invalid bastion.host_key: expected an OpenSSH public key")?;
+        let (host, port) = address.rsplit_once(':').context("bastion.address must be host:port")?;
+        let port: u16 = port.parse().context("bastion.address must be host:port")?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let key = PublicKey::new(key.key_data().clone(), "");
+        let line = key.to_openssh().context("invalid bastion.host_key")?;
+        let known_hosts = match port {
+            22 => format!("{host} {line}"),
+            _ => format!("[{host}]:{port} {line}"),
+        };
+        Ok(Self {
+            address: address.to_owned(),
+            fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+            known_hosts,
+        })
+    }
 }
 
 /// Everything the service needs, validated and loaded.
@@ -183,6 +208,9 @@ impl Config {
             limits.cpus.is_finite() && limits.cpus > 0.0 && limits.cpus <= 1024.0,
             "limits.cpus must be between 0 and 1024"
         );
+        // Whole billionths of a CPU; the fraction is dropped on purpose.
+        let nano_cpus = (limits.cpus * 1e9) as i64;
+        ensure!(nano_cpus > 0, "limits.cpus must be between 0 and 1024");
         let memory = limits
             .memory_mb
             .checked_mul(1024 * 1024)
@@ -196,17 +224,13 @@ impl Config {
             signing_key: KeyPair::from(&key),
             label: self.label.clone(),
             account: self.account.parse().context("invalid account")?,
-            bastion: Bastion {
-                address: self.bastion.address.clone(),
-                host_key: self.bastion.host_key.clone(),
-            },
+            bastion: Bastion::new(&self.bastion.address, &self.bastion.host_key)?,
             lifetime: limits.lifetime,
             max_sandboxes: limits.max_sandboxes,
             max_creations: limits.max_creations,
             limits: Limits {
                 memory,
-                // Whole billionths of a CPU; the fraction is dropped on purpose.
-                nano_cpus: (limits.cpus * 1e9) as i64,
+                nano_cpus,
                 pids: limits.pids,
                 disk: limits.disk_mb.map(|mb| format!("{mb}M")),
             },
@@ -227,7 +251,7 @@ mod tests {
         revocation_list = "/tmp/revoked"
         [bastion]
         address = "bastion.example.com:2200"
-        host_key = "SHA256:x"
+        host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbfEbwogYrnFFme1Sl6w1JQERLXBMdGiwr6LsfC+Jdj comment"
     "#;
 
     #[test]
@@ -239,6 +263,17 @@ mod tests {
     }
 
     #[test]
+    fn derives_the_bastion_host_key_forms() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbfEbwogYrnFFme1Sl6w1JQERLXBMdGiwr6LsfC+Jdj";
+        let bastion = Bastion::new("bastion.example.com:2200", &format!("{key} comment")).unwrap();
+        assert!(bastion.fingerprint.starts_with("SHA256:"));
+        assert_eq!(bastion.known_hosts, format!("[bastion.example.com]:2200 {key}"));
+        let bastion = Bastion::new("[2001:db8::1]:22", key).unwrap();
+        assert_eq!(bastion.known_hosts, format!("2001:db8::1 {key}"));
+        assert!(Bastion::new("bastion.example.com:2200", "SHA256:x").is_err());
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_bad_limits() {
         assert!(toml::from_str::<Config>(&format!("{BASE}extra = 1")).is_err());
         for limits in [
@@ -247,6 +282,7 @@ mod tests {
             "max_sandboxes = 0",
             "cpus = 0.0",
             "cpus = inf",
+            "cpus = 1e-12",
             "memory_mb = 9223372036854775807",
         ] {
             let config: Config = toml::from_str(&format!("{BASE}[limits]\n{limits}")).unwrap();

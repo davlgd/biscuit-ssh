@@ -52,7 +52,8 @@ A certificate is derived from an `Authorization` only, which embeds the request 
 - `state.json` is the single source of truth, written atomically (and the revocation list, a projection of it, rewritten after each change) before any effect relying on it; one instance per state directory (file lock).
 - Lifecycle: `Creating` (persisted before pulling) → `Active` → `Deleting`; startup undoes `Creating` and completes `Deleting`; the reaper removes expired sandboxes, containers of this instance the state does not know, and forgets vanished ones. Containers are acted on by ID; names are only looked up with the instance label.
 - Tokens expire at `expires_at - 1` (Biscuit expirations are inclusive), containers are removed from `expires_at`.
-- Every request from a non-allowed address gets the same 401 before its body is read; errors never carry Docker's messages; tokens appear only in create/renew responses, never in logs or listings.
+- Every request from a non-allowed address gets the same 401 before its body is read; every error is JSON (the authentication middleware also rewrites the framework's own), and never carries Docker's messages; tokens appear only in create/renew responses, never in logs or listings.
+- The reaper acts on Docker listings that may predate the state: a sandbox missing from one is checked again by ID before being deleted, and each pass rewrites the state and its projection. The `lifecycle.rs` tests hold both against a fake Docker socket.
 
 ## Constraints
 

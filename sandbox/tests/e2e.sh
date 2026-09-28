@@ -66,15 +66,19 @@ field() { python3 -c "import json,sys; print(json.load(open('body'))['$1'])"; }
 via() { # token login [ssh args…]
     local token=$1 login=$2; shift 2
     "$B" ssh --bastion "$E2E_BASTION" -t "$token" -i id_test "$login" -o LogLevel=ERROR \
-        -o UserKnownHostsFile="$WORK/known_hosts" -o StrictHostKeyChecking=accept-new "$@" </dev/null
+        -o UserKnownHostsFile="$WORK/known_hosts" -o StrictHostKeyChecking=yes "$@" </dev/null
 }
-create() { # image [ttl] → name in $name, token in token.$name
+create() { # image [ttl] → name in $name, token in token.$name, the bastion trusted
     local body="{\"image\":\"$1\"${2:+,\"ttl\":$2}}"
     api POST /v1/sandboxes "$body"
     [[ $code == 201 ]] || return 1
     name=$(field name)
     created+=("$name")
     field token >"token.$name"
+    field bastion_known_hosts >known_hosts
+}
+error_is() { # expected error message, from $WORK/body
+    [[ $(python3 -c "import json; print(json.load(open('body'))['error'])" 2>/dev/null) == "$1" ]]
 }
 others() { ssh -o BatchMode=yes "$E2E_ADMIN" "docker ps -a --format '{{.Names}}' | grep -v '^sb-' | sort"; }
 exists() { ssh -o BatchMode=yes "$E2E_ADMIN" "docker inspect $1 >/dev/null 2>&1"; }
@@ -97,16 +101,32 @@ check "malformed body → 400" '[[ $code == 400 ]]' "$code"
 api POST /v1/sandboxes '{"image":"alpine","extra":1}'
 check "unknown field → 400" '[[ $code == 400 ]]' "$code"
 api POST /v1/sandboxes '{"image":"ghcr.io/owner/image"}'
-check "other registry → 400" '[[ $code == 400 ]]' "$code"
+check "other registry → 400" \
+    '[[ $code == 400 ]] && error_is "invalid image reference: only Docker Hub images are accepted"' "$code $(cat body)"
+api POST /v1/sandboxes '{"image":"Alpine:Latest"}'
+check "uppercase image → 400, saying so" \
+    '[[ $code == 400 ]] && error_is "invalid image reference: repository names must be lowercase"' "$code $(cat body)"
 api POST /v1/sandboxes '{"image":"alpine","ttl":30}'
 check "ttl out of bounds → 400" '[[ $code == 400 ]]' "$code"
+api POST /v1/sandboxes '{"image":"alpine","ttl":"1h"}'
+check "ttl not a number → 400, saying so" '[[ $code == 400 && $(cat body) == *"invalid type"* ]]' "$code $(cat body)"
+python3 -c "print('{\"image\":\"' + 'a' * 4100 + '\"}')" >big.json
+code=$("${CURL[@]}" -X POST --data-binary @big.json -o body -w '%{http_code}' "$E2E_API/v1/sandboxes")
+check "body too large → 413, in JSON" '[[ $code == 413 ]] && error_is "request too large"' "$code $(cat body)"
+api PUT /v1/sandboxes
+check "wrong method → 405, in JSON" '[[ $code == 405 ]] && error_is "method not allowed"' "$code $(cat body)"
+api DELETE /v1/sandboxes/%FF
+check "undecodable path → 400, in JSON" '[[ $code == 400 ]] && error_is "bad request"' "$code $(cat body)"
 api POST /v1/sandboxes "{\"image\":\"biscuitssh/no-such-image-$RANDOM$RANDOM\"}"
 check "unknown image → 404" '[[ $code == 404 && $(field error) == "image not found" ]]' "$code $(cat body)"
 api POST /v1/sandboxes '{"image":"hello-world"}'
-check "image that exits at once → 422, nothing left" '[[ $code == 422 ]]' "$code $(cat body)"
+check "image that exits at once → 422, saying so" '[[ $code == 422 && $(cat body) == *"exits at once"* ]]' \
+    "$code $(cat body)"
 
 create alpine:3.20 || die "cannot create a sandbox: $code $(cat body)"
 first=$name
+check "response: command reads <name>.token" '[[ $(field command) == *" -t $first.token root@$first "* ]]' \
+    "$(field command)"
 out=$(via "token.$first" "root@$first" 'echo out; echo err >&2; exit 42' 2>err)
 status=$?
 check "session: stdout, stderr, exit status" '[[ $out == out && $(<err) == err && $status == 42 ]]' "$out/$(<err)/$status"

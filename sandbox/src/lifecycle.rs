@@ -7,8 +7,9 @@
 //! the state does not know are removed.
 //!
 //! A sandbox lives as long as its token: the token expires at
-//! `expires_at - 1` (Biscuit expirations are inclusive), and the reaper
-//! removes the container from `expires_at`, within [`REAP_INTERVAL`].
+//! `expires_at - 1` (Biscuit expirations are inclusive), and the reaper,
+//! passing every [`REAP_INTERVAL`], removes the container from
+//! `expires_at`; a removal Docker fails or delays is retried on each pass.
 
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,8 +51,8 @@ pub enum Failure {
     #[error("image not found")]
     ImageNotFound,
     /// The image cannot run as a sandbox.
-    #[error("image not usable: it must be a Linux image with /bin/sh whose command keeps running")]
-    ImageUnusable,
+    #[error("image not usable: {0}")]
+    ImageUnusable(&'static str),
     /// Docker Hub failed or timed out.
     #[error("cannot pull the image, retry later")]
     Registry,
@@ -207,7 +208,7 @@ impl Sandboxes {
             .await
             .map_err(|e| match e {
                 PullError::NotFound => Failure::ImageNotFound,
-                PullError::Platform => Failure::ImageUnusable,
+                PullError::Platform => Failure::ImageUnusable("no Linux variant for this host"),
                 PullError::Registry | PullError::Timeout => Failure::Registry,
             })?;
         let label = (self.settings.label.as_str(), instance);
@@ -217,15 +218,15 @@ impl Sandboxes {
             anyhow::Ok((container, usable))
         };
         match tokio::time::timeout(START_TIMEOUT, started).await {
-            Ok(Ok((container, true))) => Ok((container, image_id)),
-            Ok(Ok((container, false))) => {
+            Ok(Ok((container, Ok(())))) => Ok((container, image_id)),
+            Ok(Ok((container, Err(unusable)))) => {
                 let _ = docker::remove(&self.docker, &container).await;
-                Err(Failure::ImageUnusable)
+                Err(Failure::ImageUnusable(unusable.reason()))
             }
             Ok(Err(e)) => {
                 tracing::warn!(%name, error = %e, "cannot run the container");
                 self.remove_by_name(name, instance).await;
-                Err(Failure::ImageUnusable)
+                Err(Failure::ImageUnusable("the container does not start"))
             }
             Err(_) => {
                 self.remove_by_name(name, instance).await;
@@ -462,4 +463,149 @@ pub fn random_hex() -> anyhow::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no system random source: {e}"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::{Arc, mpsc};
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::config::Bastion;
+    use crate::docker::Limits;
+
+    const CONTAINER: &str = "container-id";
+
+    /// A fake Docker answering one container listing with `listing`, once
+    /// `release` says so, then inspections of [`CONTAINER`] as running. The
+    /// receiver tells when the listing was asked for.
+    struct FakeDocker {
+        dir: PathBuf,
+        listed: oneshot::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    fn respond(stream: &mut std::os::unix::net::UnixStream, body: &str) {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    fn sandboxes(name: &str, listing: &'static str) -> (Arc<Sandboxes>, FakeDocker) {
+        // Unix socket paths are short: not under the (long) macOS temp dir.
+        let dir = PathBuf::from("/tmp").join(format!("bssh-{name}-{}", random_hex().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (listed_tx, listed) = oneshot::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = listed_tx.send(());
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(&mut stream, listing);
+            drop(stream);
+            let running = format!(r#"{{"Id":"{CONTAINER}","Name":"/sb-new","State":{{"Running":true}}}}"#);
+            while let Ok((mut stream, _)) = listener.accept() {
+                respond(&mut stream, &running);
+            }
+        });
+        let docker = Docker::connect_with_unix(socket.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION).unwrap();
+        let store = Store::open(&dir, &dir.join("revoked"), || Ok("instance".to_owned())).unwrap();
+        let settings = Settings {
+            allowed_clients: vec![],
+            signing_key: biscuit_ssh_core::KeyPair::new(),
+            label: "label".to_owned(),
+            account: "root".parse().unwrap(),
+            bastion: Bastion {
+                address: "localhost:22".to_owned(),
+                fingerprint: String::new(),
+                known_hosts: String::new(),
+            },
+            lifetime: 3600,
+            max_sandboxes: 5,
+            max_creations: 2,
+            limits: Limits {
+                memory: 1024,
+                nano_cpus: 1,
+                pids: 10,
+                disk: None,
+            },
+            pull_timeout: Duration::from_secs(5),
+        };
+        let fake = FakeDocker { dir, listed, release };
+        (Arc::new(Sandboxes::new(docker, settings, store)), fake)
+    }
+
+    fn active() -> Sandbox {
+        Sandbox {
+            status: Status::Active,
+            image: "docker.io/library/alpine:latest".to_owned(),
+            container: Some(CONTAINER.to_owned()),
+            image_id: Some("image-id".to_owned()),
+            token: Some("cc".repeat(64)),
+            expires_at: now() + 3600,
+            client: "192.0.2.7".parse().unwrap(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_older_than_a_sandbox_does_not_delete_it() {
+        let (sandboxes, fake) = sandboxes("listing", "[]");
+        let reaping = tokio::spawn({
+            let sandboxes = Arc::clone(&sandboxes);
+            async move { sandboxes.reap_strays().await }
+        });
+        fake.listed.await.unwrap();
+        // Created while Docker was being listed.
+        let mut store = sandboxes.store.lock().await;
+        store.state.sandboxes.insert("sb-new".to_owned(), active());
+        store.save(now()).unwrap();
+        drop(store);
+        fake.release.send(()).unwrap();
+        reaping.await.unwrap();
+        let status = sandboxes.store.lock().await.state.sandboxes["sb-new"].status;
+        std::fs::remove_dir_all(&fake.dir).unwrap();
+        assert_eq!(status, Status::Active);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reaper_republishes_a_revocation_list_that_failed() {
+        let listing = r#"[{"Id":"container-id","Names":["/sb-new"]}]"#;
+        let (sandboxes, fake) = sandboxes("projection", listing);
+        let revoked = "ab".repeat(64);
+        let mut store = sandboxes.store.lock().await;
+        store.state.sandboxes.insert("sb-new".to_owned(), active());
+        store.save(now()).unwrap();
+        // The state is written, the revocation list is not.
+        std::fs::create_dir(fake.dir.join("revoked.tmp")).unwrap();
+        store.state.revoked.insert(revoked.clone(), now() + 3600);
+        assert!(store.save(now()).is_err());
+        std::fs::remove_dir(fake.dir.join("revoked.tmp")).unwrap();
+        drop(store);
+        let reaping = tokio::spawn({
+            let sandboxes = Arc::clone(&sandboxes);
+            async move { sandboxes.reap().await }
+        });
+        fake.listed.await.unwrap();
+        fake.release.send(()).unwrap();
+        reaping.await.unwrap();
+        let published = std::fs::read_to_string(fake.dir.join("revoked")).unwrap();
+        std::fs::remove_dir_all(&fake.dir).unwrap();
+        assert!(published.contains(&revoked));
+    }
 }

@@ -10,19 +10,20 @@
 //!
 //! Only allowed client addresses may call it: any other request, whatever
 //! it is, gets `401 {"error": "authentication failed"}` before its body is
-//! read. Errors are `{"error": "..."}` with fixed messages.
+//! read. Every error is `{"error": "..."}`, never Docker's own words.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::image::ImageRef;
@@ -63,9 +64,12 @@ struct LeaseResponse {
     /// Login for the bastion, `account@name`.
     login: String,
     bastion: String,
+    /// Fingerprint of the bastion's host key.
     bastion_host_key: String,
+    /// The bastion's `known_hosts` line, to trust it without a prompt.
+    bastion_known_hosts: String,
     token: String,
-    /// The command to connect, once the token is saved to `sandbox.token`.
+    /// The command to connect, once the token is saved to `<name>.token`.
     command: String,
 }
 
@@ -75,7 +79,8 @@ struct Summary {
     name: String,
     image: String,
     status: Status,
-    expires_at: u64,
+    /// Unset while the sandbox is being created.
+    expires_at: Option<u64>,
     client_ip: IpAddr,
 }
 
@@ -91,12 +96,14 @@ pub fn router(sandboxes: Arc<Sandboxes>) -> Router {
         .route("/v1/sandboxes/{name}", axum::routing::delete(delete))
         .route("/v1/sandboxes/{name}/renew", post(renew))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
+        .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed") })
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(Arc::clone(&sandboxes), authenticate))
         .with_state(sandboxes)
 }
 
-/// Lets allowed clients through, and marks responses as not cacheable.
+/// Lets allowed clients through, and marks responses as not cacheable;
+/// errors raised by the framework itself get the JSON form too.
 async fn authenticate(
     State(sandboxes): State<Arc<Sandboxes>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -111,24 +118,48 @@ async fn authenticate(
             error(StatusCode::UNAUTHORIZED, "authentication failed")
         }
     };
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"application/json"));
+    let status = response.status();
+    if (status.is_client_error() || status.is_server_error()) && !json {
+        let reason = status.canonical_reason().unwrap_or("error").to_lowercase();
+        response = error(status, &reason);
+    }
     let no_store = HeaderValue::from_static("no-store");
     response.headers_mut().insert(header::CACHE_CONTROL, no_store);
     response
 }
 
+/// Parses a JSON body, whatever its content type says; an empty body is the
+/// default request when there is one.
+fn parse<T: DeserializeOwned>(
+    body: Result<Bytes, BytesRejection>,
+    default: Option<T>,
+) -> Result<T, (StatusCode, String)> {
+    let body = body.map_err(|rejection| match rejection.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => (StatusCode::PAYLOAD_TOO_LARGE, "request too large".to_owned()),
+        _ => (StatusCode::BAD_REQUEST, "invalid request".to_owned()),
+    })?;
+    match (body.is_empty(), default) {
+        (true, Some(default)) => Ok(default),
+        _ => serde_json::from_slice(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid request: {e}"))),
+    }
+}
+
 async fn create(
     State(sandboxes): State<Arc<Sandboxes>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    body: Result<Json<CreateRequest>, JsonRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let Ok(Json(body)) = body else {
-        return error(StatusCode::BAD_REQUEST, "invalid request");
+    let body: CreateRequest = match parse(body, None) {
+        Ok(body) => body,
+        Err((status, message)) => return error(status, &message),
     };
-    let Ok(image) = body.image.parse::<ImageRef>() else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid image reference: only Docker Hub images are accepted",
-        );
+    let image = match body.image.parse::<ImageRef>() {
+        Ok(image) => image,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("invalid image reference: {e}")),
     };
     let client = peer.ip().to_canonical();
     match sandboxes.create(&image, body.ttl, client).await {
@@ -141,16 +172,11 @@ async fn renew(
     State(sandboxes): State<Arc<Sandboxes>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(name): Path<String>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    // The body is optional; when present, it must be a valid request,
-    // whatever its content type says.
-    let body = match body.is_empty() {
-        true => Ok(RenewRequest::default()),
-        false => serde_json::from_slice::<RenewRequest>(&body),
-    };
-    let Ok(RenewRequest { ttl }) = body else {
-        return error(StatusCode::BAD_REQUEST, "invalid request");
+    let RenewRequest { ttl } = match parse(body, Some(RenewRequest::default())) {
+        Ok(body) => body,
+        Err((status, message)) => return error(status, &message),
     };
     match sandboxes.renew(&name, ttl, peer.ip().to_canonical()).await {
         Ok(lease) => Json(lease_response(&sandboxes, lease)).into_response(),
@@ -174,7 +200,7 @@ async fn list(State(sandboxes): State<Arc<Sandboxes>>) -> Response {
             name,
             image: sandbox.image,
             status: sandbox.status,
-            expires_at: sandbox.expires_at,
+            expires_at: (sandbox.status != Status::Creating).then_some(sandbox.expires_at),
             client_ip: sandbox.client,
         })
         .collect();
@@ -187,8 +213,8 @@ fn lease_response(sandboxes: &Sandboxes, lease: Lease) -> LeaseResponse {
     // The token only accepts the client's address: keep ssh on its family.
     let family = if lease.client.is_ipv4() { "-4" } else { "-6" };
     let command = format!(
-        "biscuit-ssh ssh --bastion {} -t sandbox.token {login} {family}",
-        settings.bastion.address
+        "biscuit-ssh ssh --bastion {} -t {}.token {login} {family}",
+        settings.bastion.address, lease.name
     );
     LeaseResponse {
         name: lease.name,
@@ -198,7 +224,8 @@ fn lease_response(sandboxes: &Sandboxes, lease: Lease) -> LeaseResponse {
         client_ip: lease.client,
         login,
         bastion: settings.bastion.address.clone(),
-        bastion_host_key: settings.bastion.host_key.clone(),
+        bastion_host_key: settings.bastion.fingerprint.clone(),
+        bastion_known_hosts: settings.bastion.known_hosts.clone(),
         token: lease.token,
         command,
     }
@@ -210,7 +237,7 @@ fn failure_response(failure: &Failure) -> Response {
         Failure::Conflict(_) => StatusCode::CONFLICT,
         Failure::TooMany => StatusCode::TOO_MANY_REQUESTS,
         Failure::Ttl(_) => StatusCode::BAD_REQUEST,
-        Failure::ImageUnusable => StatusCode::UNPROCESSABLE_ENTITY,
+        Failure::ImageUnusable(_) => StatusCode::UNPROCESSABLE_ENTITY,
         Failure::Registry => StatusCode::BAD_GATEWAY,
         Failure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     };

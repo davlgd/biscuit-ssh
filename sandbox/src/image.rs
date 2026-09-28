@@ -18,10 +18,19 @@ pub struct ImageRef {
     digest: Option<String>,
 }
 
-/// The reference is not a valid Docker Hub image reference.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid image reference")]
-pub struct InvalidImage;
+/// Why a reference is not a valid Docker Hub image reference.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidImage {
+    /// It names another registry.
+    #[error("only Docker Hub images are accepted")]
+    OtherRegistry,
+    /// Its repository has uppercase letters.
+    #[error("repository names must be lowercase")]
+    Uppercase,
+    /// Anything else.
+    #[error("expected [namespace/]repository[:tag][@sha256:digest]")]
+    Malformed,
+}
 
 impl ImageRef {
     /// The image to pull, without tag or digest: `docker.io/library/nginx`.
@@ -51,16 +60,16 @@ impl FromStr for ImageRef {
 
     fn from_str(s: &str) -> Result<Self, InvalidImage> {
         if s.len() > 255 {
-            return Err(InvalidImage);
+            return Err(InvalidImage::Malformed);
         }
         let (rest, digest) = match s.split_once('@') {
             Some((rest, digest)) => (rest, Some(digest)),
             None => (s, None),
         };
         if let Some(digest) = digest {
-            let hex = digest.strip_prefix("sha256:").ok_or(InvalidImage)?;
+            let hex = digest.strip_prefix("sha256:").ok_or(InvalidImage::Malformed)?;
             if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                return Err(InvalidImage);
+                return Err(InvalidImage::Malformed);
             }
         }
         // A tag follows the last colon after the last slash.
@@ -75,7 +84,7 @@ impl FromStr for ImageRef {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
             if !valid {
-                return Err(InvalidImage);
+                return Err(InvalidImage::Malformed);
             }
         }
         let path = path
@@ -85,13 +94,21 @@ impl FromStr for ImageRef {
         let components: Vec<&str> = path.split('/').collect();
         // Other registries are named by a first component with a dot, a colon
         // or `localhost`; Docker Hub repositories have at most a namespace.
-        if components.len() > 2 || !components.iter().all(|c| is_component(c)) {
-            return Err(InvalidImage);
-        }
-        if let [first, _] = components.as_slice()
-            && (first.contains('.') || *first == "localhost")
+        if let [first, _, ..] = components.as_slice()
+            && (first.contains(['.', ':']) || *first == "localhost")
         {
-            return Err(InvalidImage);
+            return Err(InvalidImage::OtherRegistry);
+        }
+        if components.len() > 2 {
+            return Err(InvalidImage::Malformed);
+        }
+        if !components.iter().all(|c| is_component(c)) {
+            let lowercase = components.iter().all(|c| is_component(&c.to_ascii_lowercase()));
+            return Err(if lowercase {
+                InvalidImage::Uppercase
+            } else {
+                InvalidImage::Malformed
+            });
         }
         let repository = match components.as_slice() {
             [name] => format!("library/{name}"),
@@ -146,13 +163,17 @@ mod tests {
 
     #[test]
     fn refuses_other_registries_and_malformed_references() {
+        for (bad, why) in [
+            ("ghcr.io/owner/image", InvalidImage::OtherRegistry),
+            ("localhost/image", InvalidImage::OtherRegistry),
+            ("registry:5000/image", InvalidImage::OtherRegistry),
+            ("Alpine:Latest", InvalidImage::Uppercase),
+            ("a/b/c", InvalidImage::Malformed),
+        ] {
+            assert_eq!(bad.parse::<ImageRef>().err(), Some(why), "{bad}");
+        }
         for bad in [
             "",
-            "ghcr.io/owner/image",
-            "localhost/image",
-            "registry:5000/image",
-            "a/b/c",
-            "Alpine",
             "alpine:",
             "alpine:-tag",
             "alpine@sha256:abc",
