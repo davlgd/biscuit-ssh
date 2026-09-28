@@ -1,0 +1,28 @@
+# A separate workspace: the sandbox is an application built on biscuit-ssh,
+# with its own dependencies (Docker) and release cycle.
+[workspace]
+
+[package]
+name = "biscuit-ssh-sandbox"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["davlgd"]
+repository = "https://github.com/davlgd/biscuit-ssh"
+description = "Disposable containers reachable through the biscuit-ssh bastion"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+biscuit-ssh-core = { path = "../crates/core" }
+biscuit-ssh-service = { path = "../crates/service", features = ["http"] }
+bollard = "0.21.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "1.1.6"
+tracing = "0.1.44"

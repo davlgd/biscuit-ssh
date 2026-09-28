@@ -1,0 +1,223 @@
+//! The Docker operations of a sandbox: pull, run, check, remove.
+//!
+//! Containers run without network (the bastion reaches them through the
+//! Docker API, not over the network), with bounded memory, CPU, processes
+//! and logs, and cannot gain privileges. Every operation addresses a
+//! container by its immutable ID, except the lookup of a name left over by
+//! a crash, which is checked against this instance's label.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use anyhow::Context;
+use bollard::Docker;
+use bollard::errors::Error as DockerError;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, HostConfig, HostConfigLogConfig};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions, RemoveContainerOptions,
+};
+use futures_util::StreamExt;
+
+use crate::image::ImageRef;
+
+/// Resource limits of each sandbox.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// Memory, in bytes.
+    pub memory: i64,
+    /// CPU, in billionths of a CPU.
+    pub nano_cpus: i64,
+    /// Processes.
+    pub pids: i64,
+}
+
+/// Why an image cannot be pulled.
+#[derive(Debug, thiserror::Error)]
+pub enum PullError {
+    /// The repository, tag or digest does not exist (or is private).
+    #[error("image not found")]
+    NotFound,
+    /// No variant of the image runs on this host.
+    #[error("image not available for this platform")]
+    Platform,
+    /// Docker Hub or the daemon failed; details are logged.
+    #[error("registry error")]
+    Registry,
+    /// The pull took too long.
+    #[error("pull timed out")]
+    Timeout,
+}
+
+/// Pulls `image` and returns the ID of the image pulled, so the container
+/// runs exactly that image even if the tag moves meanwhile.
+pub async fn pull(docker: &Docker, image: &ImageRef, timeout: Duration) -> Result<String, PullError> {
+    let options = CreateImageOptions {
+        from_image: Some(image.repository()),
+        tag: Some(image.version().to_owned()),
+        ..Default::default()
+    };
+    let pulling = async {
+        let mut progress = docker.create_image(Some(options), None, None);
+        while let Some(item) = progress.next().await {
+            item.map_err(classify_pull_error)?;
+        }
+        let pulled = match image.version() {
+            version if version.starts_with("sha256:") => format!("{}@{version}", image.repository()),
+            version => format!("{}:{version}", image.repository()),
+        };
+        let inspected = docker.inspect_image(&pulled).await.map_err(|e| {
+            tracing::warn!(error = %e, "cannot inspect a pulled image");
+            PullError::Registry
+        })?;
+        if inspected.os.as_deref() != Some("linux") {
+            return Err(PullError::Platform);
+        }
+        inspected.id.ok_or(PullError::Registry)
+    };
+    tokio::time::timeout(timeout, pulling)
+        .await
+        .map_err(|_| PullError::Timeout)?
+}
+
+/// Tells a missing image apart from other failures. Docker only reports
+/// them as text, so this matches the messages it and Docker Hub use.
+fn classify_pull_error(error: DockerError) -> PullError {
+    let message = error.to_string().to_lowercase();
+    if matches!(error, DockerError::DockerResponseServerError { status_code: 404, .. })
+        || message.contains("manifest unknown")
+        || message.contains("not found")
+        || message.contains("repository does not exist")
+    {
+        PullError::NotFound
+    } else if message.contains("no matching manifest") {
+        PullError::Platform
+    } else {
+        tracing::warn!(error = %error, "pull failed");
+        PullError::Registry
+    }
+}
+
+/// Creates and starts container `name` from `image_id`, labelled
+/// `label=instance`; returns its ID.
+pub async fn run(
+    docker: &Docker,
+    name: &str,
+    image_id: &str,
+    (label, instance): (&str, &str),
+    limits: &Limits,
+) -> anyhow::Result<String> {
+    let body = ContainerCreateBody {
+        image: Some(image_id.to_owned()),
+        labels: Some(HashMap::from([(label.to_owned(), instance.to_owned())])),
+        // Like `docker run -dit`: images whose command is a shell keep running.
+        tty: Some(true),
+        open_stdin: Some(true),
+        host_config: Some(HostConfig {
+            network_mode: Some("none".to_owned()),
+            memory: Some(limits.memory),
+            memory_swap: Some(limits.memory),
+            nano_cpus: Some(limits.nano_cpus),
+            pids_limit: Some(limits.pids),
+            security_opt: Some(vec!["no-new-privileges".to_owned()]),
+            log_config: Some(HostConfigLogConfig {
+                typ: Some("json-file".to_owned()),
+                config: Some(HashMap::from([
+                    ("max-size".to_owned(), "1m".to_owned()),
+                    ("max-file".to_owned(), "1".to_owned()),
+                ])),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let options = CreateContainerOptions {
+        name: Some(name.to_owned()),
+        ..Default::default()
+    };
+    let created = docker
+        .create_container(Some(options), body)
+        .await
+        .context("cannot create the container")?;
+    docker
+        .start_container(&created.id, None)
+        .await
+        .context("cannot start the container")?;
+    Ok(created.id)
+}
+
+/// Whether container `id` keeps running and can run `/bin/sh` as `user`,
+/// which sessions through the bastion need.
+pub async fn usable(docker: &Docker, id: &str, user: &str) -> bool {
+    // A command that exits at once would be caught here.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let running = docker
+        .inspect_container(id, None::<InspectContainerOptions>)
+        .await
+        .ok()
+        .and_then(|inspected| inspected.state)
+        .and_then(|state| state.running)
+        == Some(true);
+    running && shell_works(docker, id, user).await.unwrap_or(false)
+}
+
+async fn shell_works(docker: &Docker, id: &str, user: &str) -> anyhow::Result<bool> {
+    let exec = docker
+        .create_exec(
+            id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(vec!["/bin/sh", "-c", "true"]),
+                user: Some(user),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let start = StartExecOptions {
+        detach: false,
+        tty: false,
+        output_capacity: None,
+    };
+    if let StartExecResults::Attached { mut output, .. } = docker.start_exec(&exec.id, Some(start)).await? {
+        while output.next().await.is_some() {}
+    }
+    Ok(docker.inspect_exec(&exec.id).await?.exit_code == Some(0))
+}
+
+/// Removes container `id` and its anonymous volumes, stopping it if needed.
+/// A container already gone counts as removed.
+pub async fn remove(docker: &Docker, id: &str) -> anyhow::Result<()> {
+    let options = RemoveContainerOptions {
+        force: true,
+        v: true,
+        ..Default::default()
+    };
+    match docker.remove_container(id, Some(options)).await {
+        Ok(()) | Err(DockerError::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+        Err(e) => Err(e).context("cannot remove the container"),
+    }
+}
+
+/// The containers labelled `label=instance`: (ID, name without its slash).
+pub async fn list(docker: &Docker, label: &str, instance: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let options = ListContainersOptions {
+        all: true,
+        filters: Some(HashMap::from([(
+            "label".to_owned(),
+            vec![format!("{label}={instance}")],
+        )])),
+        ..Default::default()
+    };
+    let containers = docker
+        .list_containers(Some(options))
+        .await
+        .context("cannot list containers")?;
+    Ok(containers
+        .into_iter()
+        .filter_map(|c| {
+            let name = c.names?.first()?.trim_start_matches('/').to_owned();
+            Some((c.id?, name))
+        })
+        .collect())
+}
