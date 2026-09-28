@@ -4,6 +4,9 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "http")]
+pub mod http;
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,7 +47,7 @@ pub struct Authority {
     pub ca: CertificateAuthority,
     /// See [`AuthoritySettings::clock_skew`].
     pub clock_skew: Duration,
-    revocation_list: Option<PathBuf>,
+    revocations: RevocationSource,
 }
 
 impl Authority {
@@ -76,8 +79,24 @@ impl Authority {
             verifier,
             ca,
             clock_skew,
-            revocation_list,
+            revocations: RevocationSource::new(revocation_list),
         }
+    }
+
+    /// The current revocation list, see [`RevocationSource::read`].
+    pub fn revocations(&self) -> Result<RevocationList, UnreadableRevocations> {
+        self.revocations.read()
+    }
+}
+
+/// Where a revocation list comes from: a file, or nothing (no revocation).
+#[derive(Debug, Clone)]
+pub struct RevocationSource(Option<PathBuf>);
+
+impl RevocationSource {
+    /// Reads `path` on each [`read`](Self::read); `None` revokes nothing.
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
     }
 
     /// The current revocation list, read again on each call so revocations
@@ -85,8 +104,8 @@ impl Authority {
     ///
     /// Fails closed: an unreadable list could hide a revocation, so callers
     /// must refuse access on error. The cause is logged here.
-    pub fn revocations(&self) -> Result<RevocationList, UnreadableRevocations> {
-        let Some(path) = &self.revocation_list else {
+    pub fn read(&self) -> Result<RevocationList, UnreadableRevocations> {
+        let Some(path) = &self.0 else {
             return Ok(RevocationList::default());
         };
         RevocationList::load(path).map_err(|e| {

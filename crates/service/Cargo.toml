@@ -9,8 +9,16 @@ description.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 biscuit-ssh-ca.workspace = true
 biscuit-ssh-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+# Serving an HTTP API over TLS.
+http = ["dep:axum", "dep:axum-server", "dep:rustls", "dep:serde"]

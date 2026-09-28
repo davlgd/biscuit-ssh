@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use biscuit_ssh_core::MAX_LIFETIME;
+use biscuit_ssh_service::http::Tls;
 use biscuit_ssh_service::{Authority, AuthoritySettings, default_clock_skew, default_policy};
 use serde::Deserialize;
 
@@ -54,16 +55,6 @@ pub struct Config {
     pub trusted_proxies: Vec<IpAddr>,
     /// TLS certificate and key, in PEM.
     pub tls: Option<Tls>,
-}
-
-/// TLS certificate chain and private key files, in PEM.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Tls {
-    /// Certificate chain.
-    pub certificate: PathBuf,
-    /// Private key.
-    pub key: PathBuf,
 }
 
 fn default_lifetime() -> u64 {
