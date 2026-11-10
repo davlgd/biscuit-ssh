@@ -23,6 +23,9 @@ use crate::config::{Server, Settings};
 /// How long before a lease ends its renewal starts.
 const RENEWAL_MARGIN: u64 = 5;
 
+/// Pause before evaluating a token again after a timeout.
+const RETRY_PAUSE: Duration = Duration::from_secs(1);
+
 /// An authenticated connection: the token presented and what it was
 /// checked for.
 pub struct Grant {
@@ -50,6 +53,9 @@ pub enum Refusal {
     /// The token does not allow the request at the requested time: the
     /// connection may go on until then.
     Denied,
+    /// The evaluation timed out, which may come from the load: worth
+    /// retrying while the current lease lasts, never beyond.
+    Overloaded,
     /// Revoked, invalid, or the revocation list is unreadable: stop at once.
     Immediate(&'static str),
 }
@@ -59,6 +65,7 @@ impl Refusal {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Denied => "denied",
+            Self::Overloaded => "overloaded",
             Self::Immediate(kind) => kind,
         }
     }
@@ -125,6 +132,7 @@ pub fn authorize(
         .authorize(token, request, &revoked, lifetime)
         .map_err(|e| match e {
             biscuit_ssh_core::Error::Denied(_) => Refusal::Denied,
+            biscuit_ssh_core::Error::Overloaded => Refusal::Overloaded,
             _ => Refusal::Immediate(e.kind()),
         })
 }
@@ -146,25 +154,50 @@ pub async fn guard(
             () = tokio::time::sleep_until(instant_at(lease_end.saturating_sub(RENEWAL_MARGIN))) => {}
             () = cutter.gone() => return,
         }
-        let (settings, grant) = (Arc::clone(&settings), Arc::clone(&grant));
         let start = UNIX_EPOCH + Duration::from_secs(lease_end);
-        let renewal = tokio::task::spawn_blocking(move || grant.authorize(&settings, start, settings.check_interval));
-        tokio::select! {
-            result = renewal => match result {
-                Ok(Ok(authorization)) => lease_end = authorization.valid_until(),
-                Ok(Err(Refusal::Denied)) => {
-                    // Still allowed until the lease ends, not a second more.
-                    tokio::select! {
-                        () = tokio::time::sleep_until(deadline) => {}
-                        () = cutter.gone() => return,
-                    }
-                    break "access expired";
+        let mut too_slow = "renewal too slow";
+        let result = loop {
+            // Never start an evaluation once the lease has ended. The
+            // selects below are biased for the same reason: the deadline
+            // wins over a result or a pause that are ready at that time.
+            if Instant::now() >= deadline {
+                break Err(too_slow);
+            }
+            let (settings, grant) = (Arc::clone(&settings), Arc::clone(&grant));
+            let renewal =
+                tokio::task::spawn_blocking(move || grant.authorize(&settings, start, settings.check_interval));
+            let result = tokio::select! {
+                biased;
+                () = cutter.gone() => return,
+                () = tokio::time::sleep_until(deadline) => break Err(too_slow),
+                result = renewal => result,
+            };
+            if !matches!(result, Ok(Err(Refusal::Overloaded))) {
+                break Ok(result);
+            }
+            // A timeout may come from the load: try again while the lease
+            // lasts, never beyond it.
+            too_slow = "token check overloaded";
+            tokio::select! {
+                biased;
+                () = cutter.gone() => return,
+                () = tokio::time::sleep_until(deadline) => break Err(too_slow),
+                () = tokio::time::sleep(RETRY_PAUSE) => {}
+            }
+        };
+        match result {
+            Ok(Ok(Ok(authorization))) => lease_end = authorization.valid_until(),
+            Ok(Ok(Err(Refusal::Denied))) => {
+                // Still allowed until the lease ends, not a second more.
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {}
+                    () = cutter.gone() => return,
                 }
-                Ok(Err(refusal)) => break refusal.kind(),
-                Err(_) => break "internal error",
-            },
-            () = tokio::time::sleep_until(deadline) => break "renewal too slow",
-            () = cutter.gone() => return,
+                break "access expired";
+            }
+            Ok(Ok(Err(refusal))) => break refusal.kind(),
+            Ok(Err(_)) => break "internal error",
+            Err(reason) => break reason,
         }
     };
     tracing::warn!(reason, "session cut");

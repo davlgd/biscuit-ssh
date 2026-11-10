@@ -8,7 +8,9 @@
 #   E2E_SSHD_UNIT=sshd-e2e tests/e2e.sh
 #
 # E2E_SSH_PORT and E2E_SSHD_UNIT designate an sshd dedicated to these tests,
-# never the one used to administer the server.
+# never the one used to administer the server. The issuer is reached at
+# E2E_ISSUER, https://E2E_HOST:8443 by default, and E2E_SERVER defaults to
+# `test`.
 #
 # The server needs two accounts, E2E_USER and E2E_OTHER_USER, whose principals
 # files list `E2E_SERVER:<account>`. E2E_ADMIN is an SSH destination with sudo
@@ -18,13 +20,14 @@
 # With E2E_BASTION (host:port), the bastion is tested too: it must relay
 # E2E_BASTION_SERVER, a server it alone can reach at E2E_BASTION_TARGET
 # (host:port, checked unreachable from here), where the same two accounts
-# accept the principals `E2E_BASTION_SERVER:<account>`. Its
-# session_check_interval must be at most 10 seconds. The check that nothing
+# accept the principals `E2E_BASTION_SERVER:<account>`. The bastion must use
+# the root key E2E_ROOT_KEY signs with, and read E2E_REVOKED as its revocation
+# list, with a session_check_interval of at most 10 seconds. The check that nothing
 # keeps running after a cut looks at processes on E2E_ADMIN, so it assumes
 # that host is the relayed server.
 set -uo pipefail
 die() { echo "setup failed: $*" >&2; exit 1; }
-for tool in cargo ssh sftp ssh-keygen nc cmp; do
+for tool in cargo ssh scp sftp ssh-keygen nc cmp realpath; do
     command -v "$tool" >/dev/null || die "$tool is required"
 done
 
@@ -39,7 +42,7 @@ E2E_SERVER=${E2E_SERVER:-test}
 : "${E2E_SSHD_UNIT:?systemd unit of the server's sshd}"
 export BISCUIT_SSH_ISSUER=${E2E_ISSUER:-https://$E2E_HOST:8443}
 
-cargo build --release --quiet --bin biscuit-ssh || die "build"
+cargo build --release --quiet -p biscuit-ssh --features certificates || die "build"
 B=$PWD/target/release/biscuit-ssh
 ROOT_KEY=$(realpath "$E2E_ROOT_KEY")
 ISSUER_CA=()
@@ -245,8 +248,30 @@ if [[ -n ${E2E_BASTION:-} ]]; then
     expect_fail "bastion: token bound to another key refused" "access refused (denied)" via t_key "$login_ok" true
     expect_fail "bastion: another account refused" "access refused (denied)" \
         via btoken "$E2E_OTHER_USER@$E2E_BASTION_SERVER" true
-    attenuate -t btoken --command uptime >t_cmd
-    expect_fail "bastion: command-restricted token refused" "access refused (denied)" via t_cmd "$login_ok" uptime
+    # Forced commands: the bastion asks for the command when the token alone
+    # is refused, and sshd runs it whatever the client asks.
+    attenuate -t btoken --command 'echo forced' >t_cmd
+    expect_fail "bastion: command token without --command refused" "access refused (denied)" \
+        via t_cmd "$login_ok" 'echo forced'
+    out=$("$B" ssh --bastion "$E2E_BASTION" -i id_test -t t_cmd --command 'echo forced' "$login_ok" \
+        -o UserKnownHostsFile="$WORK/known_hosts" 'echo free' </dev/null 2>&1)
+    if [[ $out == forced ]]; then ok "bastion: command token runs its forced command"; else ko "bastion: forced command: $out"; fi
+    expect_fail "bastion: command token, another command refused" "access refused (denied)" \
+        "$B" ssh --bastion "$E2E_BASTION" -i id_test -t t_cmd --command 'echo other' "$login_ok" \
+        -o UserKnownHostsFile="$WORK/known_hosts" true </dev/null
+    out=$("$B" ssh --bastion "$E2E_BASTION" -i id_test -t btoken --command 'echo forced' "$login_ok" \
+        -o UserKnownHostsFile="$WORK/known_hosts" -tt </dev/null 2>&1 | tr -d '\r')
+    if [[ $out == forced* ]]; then ok "bastion: --command forced on a token allowing any session"; else ko "bastion: --command with a full token: $out"; fi
+    # An open connection, without command, is never joined: neither through
+    # the ssh configuration, nor explicitly.
+    via btoken "$login_ok" -M -S "$WORK/free" -f -N
+    printf 'Host *\n  ControlMaster auto\n  ControlPath %s\n' "$WORK/free" >mux_config
+    out=$("$B" ssh --bastion "$E2E_BASTION" -i id_test -t btoken --command 'echo forced' "$login_ok" \
+        -F mux_config -o UserKnownHostsFile="$WORK/known_hosts" 'echo free' </dev/null 2>&1)
+    if [[ $out == forced ]]; then ok "bastion: --command never joins a configured master"; else ko "bastion: --command with a configured master: $out"; fi
+    expect_fail "bastion: --command refuses explicit multiplexing" "connection of its own" \
+        "$B" ssh --bastion "$E2E_BASTION" -i id_test -t btoken --command 'echo forced' "$login_ok" -S "$WORK/free" 'echo free'
+    ssh -S "$WORK/free" -O exit x >/dev/null 2>&1
     expect_fail "bastion: token without key refused" "Permission denied" \
         "${askpass[@]}" ssh -p "${E2E_BASTION##*:}" -o PubkeyAuthentication=no "${bastion_opts[@]}" \
         "${E2E_BASTION%:*}" true

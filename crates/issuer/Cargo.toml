@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "HTTP service that exchanges Biscuit tokens for short-lived OpenSSH certificates"
+readme = "../../docs/certificates.md"
+keywords = ["biscuit", "ssh", "openssh", "certificate", "authorization"]
+categories = ["authentication", "web-programming::http-server"]
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 biscuit-ssh-ca.workspace = true
 biscuit-ssh-core = { workspace = true, features = ["api"] }
-biscuit-ssh-service = { workspace = true, features = ["http"] }
+biscuit-ssh-service = { workspace = true, features = ["authority", "http"] }
 clap.workspace = true
 serde.workspace = true
 tokio.workspace = true

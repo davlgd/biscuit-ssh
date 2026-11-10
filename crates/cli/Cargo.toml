@@ -5,13 +5,23 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "Client of biscuit-ssh: connects through the bastion with a Biscuit token, restricts and inspects tokens, and administers root keys"
+readme = "../../README.md"
+keywords = ["biscuit", "ssh", "token", "bastion", "authorization"]
+categories = ["command-line-utilities", "authentication"]
+
+[features]
+# Certificates from the issuer, off by default: `biscuit-ssh login`, and
+# `biscuit-ssh ssh` without `--bastion`. Brings the HTTP and TLS client;
+# without it, the client only connects through the bastion.
+certificates = ["dep:ureq", "dep:ssh-key", "biscuit-ssh-core/api"]
 
 [dependencies]
 anyhow.workspace = true
 biscuit-ssh-ca.workspace = true
-biscuit-ssh-core = { workspace = true, features = ["api"] }
+biscuit-ssh-core.workspace = true
 clap.workspace = true
-ureq.workspace = true
-ssh-key.workspace = true
+ureq = { workspace = true, optional = true }
+ssh-key = { workspace = true, optional = true }
 rpassword.workspace = true
+serde_json.workspace = true

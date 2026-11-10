@@ -95,6 +95,7 @@ impl Issuer {
             .authorize(&body.token, &request, &revoked, self.lifetime)
             .map_err(|e| match e {
                 biscuit_ssh_core::Error::InvalidInput { .. } => bad_request(&e),
+                biscuit_ssh_core::Error::Overloaded => IssueError::Busy,
                 biscuit_ssh_core::Error::Datalog(_) => {
                     tracing::error!(kind = e.kind(), "datalog failure");
                     IssueError::Internal

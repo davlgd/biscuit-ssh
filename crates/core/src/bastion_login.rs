@@ -7,6 +7,11 @@
 //! an answer ending with [`MORE`] means another part follows, which the
 //! bastion asks for with the next prompt, up to [`MAX_TOKEN_LEN`] in all.
 //! Tokens are base64url, so `MORE` never appears in them.
+//!
+//! When the token alone doesn't allow the login, the bastion then asks for
+//! a command with [`COMMAND_PROMPT`]: an empty answer keeps the refusal,
+//! and a command is checked with the token, then forced on every session,
+//! like a `force-command` certificate.
 
 use crate::MAX_TOKEN_LEN;
 
@@ -19,6 +24,18 @@ pub const MORE: char = '+';
 /// The most parts a token can take.
 pub const MAX_PARTS: usize = MAX_TOKEN_LEN.div_ceil(MAX_PART_LEN);
 
+/// The prompt asking for the command to force, see the module documentation.
+pub const COMMAND_PROMPT: &str = "Biscuit command: ";
+
+/// What a bastion prompt asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// This part (from 1) of the token.
+    TokenPart(usize),
+    /// The command to force.
+    Command,
+}
+
 /// The prompt asking for part `part` (from 1) of the token.
 pub fn prompt(part: usize) -> String {
     match part {
@@ -27,10 +44,10 @@ pub fn prompt(part: usize) -> String {
     }
 }
 
-/// The part a prompt asks for, whether shown as is or prefixed with
+/// What a bastion prompt asks for, whether shown as is or prefixed with
 /// `(login@host) ` as recent OpenSSH versions do. `None` for any other
-/// prompt, which must never be answered with the token.
-pub fn parse_prompt(prompt: &str) -> Option<usize> {
+/// prompt, which must never be answered with the token or the command.
+pub fn parse_prompt(prompt: &str) -> Option<Prompt> {
     let prompt = match prompt.strip_prefix('(') {
         Some(rest) => {
             let (login, rest) = rest.split_once(") ")?;
@@ -41,7 +58,12 @@ pub fn parse_prompt(prompt: &str) -> Option<usize> {
         }
         None => prompt,
     };
-    (1..=MAX_PARTS).find(|&part| self::prompt(part) == prompt)
+    if prompt == COMMAND_PROMPT {
+        return Some(Prompt::Command);
+    }
+    (1..=MAX_PARTS)
+        .find(|&part| self::prompt(part) == prompt)
+        .map(Prompt::TokenPart)
 }
 
 /// The answer to the prompt for part `part` of `token`: that part, followed
@@ -104,12 +126,20 @@ mod tests {
 
     #[test]
     fn recognizes_only_token_prompts() {
-        assert_eq!(parse_prompt("Biscuit token: "), Some(1));
+        assert_eq!(parse_prompt("Biscuit token: "), Some(Prompt::TokenPart(1)));
         assert_eq!(
             parse_prompt("(deploy@web-1@bastion.example.com) Biscuit token: "),
-            Some(1)
+            Some(Prompt::TokenPart(1))
         );
-        assert_eq!(parse_prompt("(deploy@web-1@bastion) Biscuit token (part 3): "), Some(3));
+        assert_eq!(
+            parse_prompt("(deploy@web-1@bastion) Biscuit token (part 3): "),
+            Some(Prompt::TokenPart(3))
+        );
+        assert_eq!(parse_prompt("Biscuit command: "), Some(Prompt::Command));
+        assert_eq!(
+            parse_prompt("(deploy@web-1@bastion) Biscuit command: "),
+            Some(Prompt::Command)
+        );
         for other in [
             "Enter passphrase for key 'id': ",
             "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
@@ -120,6 +150,8 @@ mod tests {
             "Biscuit token (part 0): ",
             "Biscuit token (part 99): ",
             "Biscuit token: Biscuit token: ",
+            "Biscuit command:",
+            "x Biscuit command: ",
         ] {
             assert_eq!(parse_prompt(other), None, "{other}");
         }

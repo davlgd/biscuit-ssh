@@ -30,6 +30,11 @@ pub enum Error {
     /// The token is valid but its checks or the verifier policies refuse the request.
     #[error("access denied: {0}")]
     Denied(#[source] TokenError),
+    /// The evaluation ran out of time. That may come from the load, and the
+    /// request may then succeed when retried; a costly token can also time
+    /// out every time. Access is refused meanwhile.
+    #[error("token evaluation timed out")]
+    Overloaded,
 
     /// Datalog could not be built (bad operator policy, internal error).
     #[error("datalog error: {0}")]
@@ -44,6 +49,7 @@ impl Error {
             Self::InvalidToken(_) => "invalid_token",
             Self::Revoked(_) => "revoked",
             Self::Denied(_) => "denied",
+            Self::Overloaded => "overloaded",
             Self::Datalog(_) => "datalog",
         }
     }

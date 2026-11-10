@@ -39,12 +39,7 @@ pub async fn serve(app: Router, listen: SocketAddr, tls: Option<&Tls>) -> anyhow
 
     match tls {
         Some(tls) => {
-            // Both rustls providers may be compiled in through dependencies;
-            // pick one explicitly. Failure only means one is already set.
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let config = RustlsConfig::from_pem_file(&tls.certificate, &tls.key)
-                .await
-                .context("cannot load TLS certificate or key")?;
+            let config = load_tls(tls).await?;
             tracing::info!(%listen, "serving over TLS");
             axum_server::bind_rustls(listen, config)
                 .handle(handle)
@@ -57,4 +52,15 @@ pub async fn serve(app: Router, listen: SocketAddr, tls: Option<&Tls>) -> anyhow
         }
     }
     Ok(())
+}
+
+/// Loads the TLS certificate chain and key of `tls`, failing if either is
+/// unreadable or they don't match.
+pub async fn load_tls(tls: &Tls) -> anyhow::Result<RustlsConfig> {
+    // Both rustls providers may be compiled in through dependencies; pick
+    // one explicitly. Failure only means one is already set.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    RustlsConfig::from_pem_file(&tls.certificate, &tls.key)
+        .await
+        .context("cannot load TLS certificate or key")
 }

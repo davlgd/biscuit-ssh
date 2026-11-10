@@ -2,18 +2,21 @@
 //!
 //! `biscuit-ssh ssh --bastion` runs `ssh` with itself as `SSH_ASKPASS`, and
 //! the token in [`TOKEN_ENV`]. `ssh` then runs `biscuit-ssh <prompt>` for
-//! each question: the bastion's token prompts are answered with the token
-//! (see [`bastion_login`]); any other one (key passphrase, host key
-//! confirmation) is asked on the terminal, so the token can never answer
-//! something else.
+//! each question: the bastion's token prompts are answered with the token,
+//! and its command prompt with the command, if any (see [`bastion_login`]);
+//! any other one (key passphrase, host key confirmation) is asked on the
+//! terminal, so the token can never answer something else.
 
 use std::io::{BufRead, Write};
 
 use anyhow::Context;
-use biscuit_ssh_core::bastion_login;
+use biscuit_ssh_core::bastion_login::{self, Prompt};
 
 /// Environment variable carrying the token to `biscuit-ssh` run as askpass.
 pub const TOKEN_ENV: &str = "BISCUIT_SSH_ASKPASS_TOKEN";
+
+/// Environment variable carrying the command to force, empty for none.
+pub const COMMAND_ENV: &str = "BISCUIT_SSH_ASKPASS_COMMAND";
 
 /// Runs as askpass when `ssh` started this process for a prompt: returns
 /// `None` otherwise.
@@ -38,11 +41,19 @@ const NO_TERMINAL: &str = "no terminal to answer ssh's question (for scripts, tr
     beforehand: -o UserKnownHostsFile=FILE with its key, or -o StrictHostKeyChecking=accept-new)";
 
 fn answer(prompt: &str, token: &str) -> anyhow::Result<()> {
-    if let Some(part) = bastion_login::parse_prompt(prompt) {
-        let answer =
-            bastion_login::answer(token, part).context("the bastion asked for more of the token than exists")?;
-        println!("{answer}");
-        return Ok(());
+    match bastion_login::parse_prompt(prompt) {
+        Some(Prompt::TokenPart(part)) => {
+            let answer =
+                bastion_login::answer(token, part).context("the bastion asked for more of the token than exists")?;
+            println!("{answer}");
+            return Ok(());
+        }
+        Some(Prompt::Command) => {
+            // An empty answer: the token alone was refused, and stays so.
+            println!("{}", std::env::var(COMMAND_ENV).unwrap_or_default());
+            return Ok(());
+        }
+        None => {}
     }
     let answer = match std::env::var("SSH_ASKPASS_PROMPT").as_deref() {
         // A notice, e.g. "touch your security key": show it, nothing to read.

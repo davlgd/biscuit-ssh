@@ -142,14 +142,14 @@ impl Verifier {
         }
         let evaluate = |second| context.clone().fact(time_fact(second))?.build(&token)?.authorize();
 
-        evaluate(start).map_err(Error::Denied)?;
+        evaluate(start).map_err(refusal)?;
         let end = start
             .checked_add(lifetime.as_secs())
             .ok_or(Error::invalid("time", "too far in the future"))?;
         let mut valid_until = end;
         for second in start + 1..end {
             if Instant::now() > deadline {
-                return Err(Error::Denied(TokenError::RunLimit(RunLimit::Timeout)));
+                return Err(Error::Overloaded);
             }
             match evaluate(second) {
                 Ok(_) => {}
@@ -157,7 +157,7 @@ impl Verifier {
                     valid_until = second;
                     break;
                 }
-                Err(e) => return Err(Error::Denied(e)),
+                Err(e) => return Err(refusal(e)),
             }
         }
         Ok(Authorization {
@@ -166,6 +166,19 @@ impl Verifier {
             valid_from: start,
             valid_until,
         })
+    }
+}
+
+/// The error for a failed evaluation.
+///
+/// Running out of time may come from the load, so it is told apart from a
+/// refusal: the issuer answers it as a temporary failure, and the bastion
+/// retries while the lease lasts. Too many facts or iterations depend on the
+/// token alone, and stay a refusal.
+fn refusal(error: TokenError) -> Error {
+    match error {
+        TokenError::RunLimit(RunLimit::Timeout) => Error::Overloaded,
+        error => Error::Denied(error),
     }
 }
 
@@ -240,6 +253,18 @@ mod tests {
         let block = BlockBuilder::new().code(code).unwrap();
         let token = UnverifiedBiscuit::from_base64(token).unwrap();
         token.append(block).unwrap().to_base64().unwrap()
+    }
+
+    #[test]
+    fn tells_overload_from_refusal() {
+        assert!(matches!(
+            refusal(TokenError::RunLimit(RunLimit::Timeout)),
+            Error::Overloaded
+        ));
+        assert_eq!(Error::Overloaded.kind(), "overloaded");
+        for limit in [RunLimit::TooManyFacts, RunLimit::TooManyIterations] {
+            assert!(matches!(refusal(TokenError::RunLimit(limit)), Error::Denied(_)));
+        }
     }
 
     #[test]

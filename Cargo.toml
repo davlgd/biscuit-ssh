@@ -1,19 +1,21 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# A plain `cargo build` leaves certificates out: the issuer is built on
+# request, like the `certificates` feature of the client.
+default-members = ["crates/bastion", "crates/cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["davlgd"]
 repository = "https://github.com/davlgd/biscuit-ssh"
-description = "SSH access for third parties through Biscuit tokens"
 
 [workspace.dependencies]
-biscuit-ssh-core = { path = "crates/core" }
-biscuit-ssh-ca = { path = "crates/ca" }
-biscuit-ssh-service = { path = "crates/service" }
+biscuit-ssh-core = { version = "0.3.0", path = "crates/core" }
+biscuit-ssh-ca = { version = "0.3.0", path = "crates/ca" }
+biscuit-ssh-service = { version = "0.3.0", path = "crates/service" }
 # `datalog-macro` is unused but biscuit-auth 6.0.0 fails to build without it.
 biscuit-auth = { version = "6.0.0", default-features = false, features = ["datalog-macro"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
@@ -21,20 +23,20 @@ thiserror = "2.0.21"
 anyhow = "1.0.104"
 axum = "0.8.9"
 # TLS through rustls with the ring provider, like the client.
-axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9.0", features = ["tls-rustls-no-provider"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "net"] }
-toml = "1.1.6"
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-ureq = { version = "3.4.2", features = ["json"] }
+ureq = { version = "3.5.1", features = ["json"] }
 bytes = "1.12.1"
 # SSH server and client of the bastion, on ring like the rest of the workspace.
-russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 rpassword = "7.5.4"
-# Docker Engine API, for the bastion's container targets and the sandbox.
+# Docker Engine API, for the bastion's container targets.
 bollard = "0.21.1"
 futures-util = "0.3.34"

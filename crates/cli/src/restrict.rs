@@ -24,8 +24,8 @@ pub struct Restrictions {
     /// Only as this account.
     #[arg(long = "user", value_name = "NAME")]
     users: Vec<Name>,
-    /// Only with this forced command (interactive sessions are then refused;
-    /// the bastion refuses such tokens for now).
+    /// Only in sessions forced to this command, given with `ssh --command`:
+    /// interactive sessions are then refused.
     #[arg(long = "command", value_name = "COMMAND")]
     commands: Vec<Command>,
     /// Only with this SSH key: a SHA256 fingerprint or a public key file.

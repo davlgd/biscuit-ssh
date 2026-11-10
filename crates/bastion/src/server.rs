@@ -3,7 +3,11 @@
 //! Clients log in as `user@server`, where `server` names a configured
 //! target. Authentication takes two steps: a public key (its fingerprint is
 //! the `public_key` fact), then the token through keyboard-interactive, in
-//! parts (see [`bastion_login`]).
+//! parts (see [`bastion_login`]). When the token alone doesn't allow the
+//! login, the bastion asks for a command, which it checks with the token
+//! and forces on every session of the connection, as `sshd` does with
+//! `force-command`: through the certificate it logs in to servers with, and
+//! by running it in containers whatever the client asks.
 //!
 //! Only session channels are relayed (shell, exec, subsystems such as sftp,
 //! with terminal and signal handling), to a server over SSH or into a
@@ -18,10 +22,10 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow, bail};
 use biscuit_ssh_core::bastion_login::{self, Assembly, Progress};
-use biscuit_ssh_core::{AccessRequest, Mode, Name};
+use biscuit_ssh_core::{AccessRequest, Command, Mode, Name};
 use bytes::Bytes;
-use russh::keys::{HashAlg, PublicKey};
-use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+use russh::keys::HashAlg;
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, Sig};
 use tokio::sync::{Semaphore, oneshot, watch};
 use tracing::Instrument;
@@ -39,6 +43,15 @@ fn ask_token_part(part: usize) -> Auth {
         name: Cow::Borrowed(""),
         instructions: Cow::Borrowed(""),
         prompts: Cow::Owned(vec![(Cow::Owned(bastion_login::prompt(part)), false)]),
+    }
+}
+
+/// Asks for the command to force, see [`bastion_login::COMMAND_PROMPT`].
+fn ask_command() -> Auth {
+    Auth::Partial {
+        name: Cow::Borrowed(""),
+        instructions: Cow::Borrowed(""),
+        prompts: Cow::Owned(vec![(Cow::Borrowed(bastion_login::COMMAND_PROMPT), true)]),
     }
 }
 
@@ -69,7 +82,8 @@ impl Refused {
     fn explanation(&self, peer: IpAddr) -> String {
         let meaning = match self.kind {
             "invalid_login" => "log in as user@server, with the server named as in the token",
-            "denied" => "the token does not allow this login (server, account, restrictions or expiry)",
+            "invalid_command" => "the command must be a single printable line of at most 1024 bytes",
+            "denied" => "the token does not allow this login (server, account, command, restrictions or expiry)",
             "revoked" => "the token has been revoked",
             "invalid_token" => "the token is malformed or not issued for this bastion",
             "busy" => "the bastion is busy, retry later",
@@ -80,6 +94,13 @@ impl Refused {
             self.kind
         )
     }
+}
+
+/// A token refused without a command, waiting for the client's command.
+struct AwaitingCommand {
+    login: String,
+    fingerprint: String,
+    token: String,
 }
 
 /// One client connection.
@@ -94,6 +115,9 @@ pub struct Connection {
     verified_key: Option<(String, String)>,
     /// The token received so far.
     token_parts: Assembly,
+    /// The token, when it was refused without a command and the client was
+    /// asked for one, with the login and key fingerprint it came with.
+    awaiting_command: Option<AwaitingCommand>,
     /// Set when the token was refused: the client has been told why, and
     /// the connection ends on its next answer.
     refused: bool,
@@ -130,6 +154,7 @@ impl Connection {
             span: tracing::info_span!("client", %peer, server = tracing::field::Empty),
             verified_key: None,
             token_parts: Assembly::default(),
+            awaiting_command: None,
             refused: false,
             grant: None,
             cut: cutter.watch(),
@@ -139,8 +164,15 @@ impl Connection {
         }
     }
 
-    /// Checks the token presented by the client for `login`.
-    async fn authenticate(&mut self, login: &str, fingerprint: String, token: String) -> Result<(), Refused> {
+    /// Checks the token presented by the client for `login`, with the
+    /// command to force if any.
+    async fn authenticate(
+        &mut self,
+        login: &str,
+        fingerprint: String,
+        token: String,
+        command: Option<Command>,
+    ) -> Result<(), Refused> {
         let (user, server) = login
             .rsplit_once('@')
             .and_then(|(user, server)| Some((user.parse::<Name>().ok()?, server.parse::<Name>().ok()?)))
@@ -158,7 +190,7 @@ impl Connection {
             source_ip: self.peer,
             server: server.clone(),
             user,
-            command: None,
+            command,
             public_key: fingerprint,
             mode: Mode::Bastion,
         };
@@ -180,6 +212,8 @@ impl Connection {
             // A name that is no server is checked as a container: a token for
             // servers then fails there, and must look like any unknown name.
             (Kind::Container, "invalid_token") => unknown(),
+            // A timeout depends on the load: the client may retry.
+            (_, "overloaded") => Refused::new("busy", anyhow!("token evaluation timed out")),
             (_, kind) => Refused::new(kind, anyhow!("token refused")),
         })?;
 
@@ -201,6 +235,7 @@ impl Connection {
             user = %grant.request.user,
             key = %grant.request.public_key,
             token = authorization.token_id(),
+            command = grant.request.command.as_ref().map(Command::as_str),
             "authenticated"
         );
         self.grant = Some((grant, authorization.valid_until()));
@@ -283,6 +318,9 @@ impl Connection {
             bail!("not a container session");
         };
         let (container, user, docker) = (container.clone(), grant.request.user.clone(), containers.docker.clone());
+        // A forced command replaces whatever the client asked, as with sshd.
+        let forced = grant.request.command.as_ref().map(|c| c.as_str().as_bytes().to_vec());
+        let command = forced.as_deref().or(command);
         let channel = self.container_channel(id).context("unknown channel")?;
         let cut = output.cut.clone();
         let started = until_cut(cut, channel.start(&docker, &container, user.as_str(), command, output)).await;
@@ -369,9 +407,11 @@ impl Drop for Connection {
 impl russh::server::Handler for Connection {
     type Error = anyhow::Error;
 
-    async fn auth_publickey(&mut self, login: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(&mut self, login: &str, key: VerifiedPublicKey<'_>) -> Result<Auth, Self::Error> {
         // Called once the client proved it holds the key.
-        self.verified_key = Some((login.to_owned(), key.fingerprint(HashAlg::Sha256).to_string()));
+        let fingerprint = key.public_key.fingerprint(HashAlg::Sha256).to_string();
+        self.verified_key = Some((login.to_owned(), fingerprint));
+        self.awaiting_command = None;
         Ok(Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::KeyboardInteractive][..])),
             partial_success: true,
@@ -400,20 +440,57 @@ impl russh::server::Handler for Connection {
         }
         let Some(mut response) = response else {
             self.token_parts = Assembly::default();
+            self.awaiting_command = None;
             return Ok(ask_token_part(1));
         };
-        let answer = response
-            .next()
-            .map(|t| String::from_utf8_lossy(&t).into_owned())
-            .unwrap_or_default();
+        let answer = response.next().unwrap_or_default();
+        if let Some(awaiting) = self.awaiting_command.take() {
+            // Only one command per connection: a refusal ends it. The
+            // command goes with the login and key the token came with.
+            if awaiting.login != login || awaiting.fingerprint != fingerprint {
+                return Ok(self.refuse(Refused::new("invalid_login", anyhow!("login changed"))));
+            }
+            let command = match String::from_utf8(answer.to_vec()) {
+                Ok(command) if command.is_empty() => {
+                    Err(Refused::new("denied", anyhow!("token refused, and no command given")))
+                }
+                Ok(command) => command
+                    .parse::<Command>()
+                    .map_err(|e| Refused::new("invalid_command", e.into())),
+                Err(_) => Err(Refused::new("invalid_command", anyhow!("not UTF-8"))),
+            };
+            let result = match command {
+                Ok(command) => {
+                    self.authenticate(login, fingerprint, awaiting.token, Some(command))
+                        .await
+                }
+                Err(refused) => Err(refused),
+            };
+            return Ok(match result {
+                Ok(()) => Auth::Accept,
+                Err(refused) => self.refuse(refused),
+            });
+        }
         // The token comes in parts, see `bastion_login`.
-        let token = match self.token_parts.push(&answer) {
+        let token = match self.token_parts.push(&String::from_utf8_lossy(&answer)) {
             Ok(Progress::Next(part)) => return Ok(ask_token_part(part)),
             Ok(Progress::Done(token)) => token,
             Err(e) => return Ok(self.refuse(Refused::new("invalid_token", e.into()))),
         };
-        match self.authenticate(login, fingerprint, token).await {
+        match self.authenticate(login, fingerprint.clone(), token.clone(), None).await {
             Ok(()) => Ok(Auth::Accept),
+            // The token may only allow sessions forced to a command: ask
+            // for it. Nothing is inferred from the refusal, which looks the
+            // same to the client either way.
+            Err(refused) if refused.kind == "denied" => {
+                tracing::info!(parent: &self.span, error = %refused.detail, "refused without a command, asking for one");
+                self.awaiting_command = Some(AwaitingCommand {
+                    login: login.to_owned(),
+                    fingerprint,
+                    token,
+                });
+                Ok(ask_command())
+            }
             Err(refused) => Ok(self.refuse(refused)),
         }
     }

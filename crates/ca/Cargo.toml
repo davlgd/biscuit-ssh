@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "OpenSSH certificate authority of biscuit-ssh, which signs short-lived certificates for authorized Biscuit tokens"
+readme = "README.md"
+keywords = ["biscuit", "ssh", "openssh", "certificate", "authorization"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 biscuit-ssh-core.workspace = true

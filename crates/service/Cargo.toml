@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "Plumbing shared by the biscuit-ssh services: revocation lists, logging, shutdown, token authority, and TLS serving"
+readme = "README.md"
+keywords = ["biscuit", "ssh", "authorization", "service"]
+categories = ["authentication", "network-programming"]
 
 [dependencies]
 anyhow.workspace = true
@@ -13,12 +16,15 @@ axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-biscuit-ssh-ca.workspace = true
+biscuit-ssh-ca = { workspace = true, optional = true }
 biscuit-ssh-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
+# The authority of the issuer and the bastion: token verification and
+# certificate signing.
+authority = ["dep:biscuit-ssh-ca"]
 # Serving an HTTP API over TLS.
 http = ["dep:axum", "dep:axum-server", "dep:rustls", "dep:serde"]

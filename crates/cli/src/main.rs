@@ -1,8 +1,13 @@
-//! `biscuit-ssh`: connects with certificates from the issuer or through the
-//! bastion, restricts and inspects tokens, and administers root keys.
+//! `biscuit-ssh`: connects through the bastion, or with certificates from
+//! the issuer (`certificates` feature, off by default), restricts and inspects
+//! tokens, and administers root keys.
 
 mod askpass;
-mod login;
+mod bastion;
+#[cfg(feature = "certificates")]
+mod certificate;
+mod credentials;
+mod multiplexing;
 mod restrict;
 mod ssh;
 
@@ -10,9 +15,10 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use biscuit_ssh_core::{KeyPair, PrivateKey, Right, attenuate, inspect, mint};
+use biscuit_ssh_core::{BlockInfo, KeyPair, PrivateKey, Right, attenuate, inspect, mint};
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::credentials::TokenSource;
 use crate::restrict::Restrictions;
 
 #[derive(Parser)]
@@ -28,7 +34,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Login(login::Args),
+    #[cfg(feature = "certificates")]
+    Login(certificate::Args),
     Ssh(ssh::Args),
     /// Restrict or inspect tokens.
     #[command(subcommand)]
@@ -43,18 +50,20 @@ enum TokenCommand {
     /// Add restrictions to a token, e.g. before handing it over; prints the
     /// new token.
     Attenuate {
-        /// Token file, `-` for standard input.
-        #[arg(short, long, value_name = "FILE", env = "BISCUIT_SSH_TOKEN_FILE")]
-        token: PathBuf,
+        #[command(flatten)]
+        token: TokenSource,
         #[command(flatten)]
         restrictions: Restrictions,
     },
     /// Show a token's blocks and their revocation identifiers, without
     /// verifying its signature.
     Inspect {
-        /// Token file, `-` for standard input.
-        #[arg(short, long, value_name = "FILE", env = "BISCUIT_SSH_TOKEN_FILE")]
-        token: PathBuf,
+        #[command(flatten)]
+        token: TokenSource,
+        /// Print a JSON array of `{"index", "revocation_id", "source"}`
+        /// objects, one per block, for scripts.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -89,14 +98,20 @@ fn main() -> anyhow::Result<()> {
         return result;
     }
     match Cli::parse().command {
-        Command::Login(args) => login::run(args),
+        #[cfg(feature = "certificates")]
+        Command::Login(args) => certificate::run(args),
         Command::Ssh(args) => ssh::run(args),
         Command::Token(TokenCommand::Attenuate { token, restrictions }) => {
-            println!("{}", attenuate(&read_token(&token)?, &restrictions.build()?)?);
+            println!("{}", attenuate(&token.read()?, &restrictions.build()?)?);
             Ok(())
         }
-        Command::Token(TokenCommand::Inspect { token }) => {
-            for (index, block) in inspect(&read_token(&token)?)?.iter().enumerate() {
+        Command::Token(TokenCommand::Inspect { token, json }) => {
+            let blocks = inspect(&token.read()?)?;
+            if json {
+                println!("{}", blocks_json(&blocks));
+                return Ok(());
+            }
+            for (index, block) in blocks.iter().enumerate() {
                 println!("# block {index}, revocation id {}", block.revocation_id);
                 println!("{}\n", block.source.trim());
             }
@@ -144,6 +159,21 @@ pub(crate) fn read_token(path: &Path) -> anyhow::Result<String> {
     Ok(token.to_owned())
 }
 
+/// The blocks of a token as a JSON array, for `token inspect --json`.
+fn blocks_json(blocks: &[BlockInfo]) -> serde_json::Value {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            serde_json::json!({
+                "index": index,
+                "revocation_id": block.revocation_id,
+                "source": block.source.trim(),
+            })
+        })
+        .collect()
+}
+
 /// Writes a new file readable by its owner only; never overwrites.
 fn write_secret(path: &Path, content: &str) -> anyhow::Result<()> {
     let mut options = std::fs::OpenOptions::new();
@@ -159,6 +189,29 @@ fn write_secret(path: &Path, content: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks the whole command line definition, in each feature set: clap
+    /// only checks the parts a parse goes through.
+    #[test]
+    fn defines_a_consistent_command_line() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn inspects_tokens_as_json() {
+        let root = KeyPair::new();
+        let token = mint(&root, &["web-1:deploy".parse().unwrap()], &[]).unwrap();
+        let blocks = blocks_json(&inspect(&token).unwrap());
+        let block = &blocks.as_array().unwrap()[0];
+        assert_eq!(block["index"], 0);
+        assert_eq!(block["revocation_id"].as_str().unwrap().len(), 128);
+        assert!(
+            block["source"]
+                .as_str()
+                .unwrap()
+                .contains("right(\"web-1\", \"deploy\")")
+        );
+    }
 
     #[test]
     fn refuses_empty_tokens() {

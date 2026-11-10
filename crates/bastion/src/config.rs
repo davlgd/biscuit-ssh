@@ -177,6 +177,14 @@ impl Config {
         })?;
         let host_key = PrivateKey::read_openssh_file(&self.host_key)
             .with_context(|| format!("cannot load host key {}", self.host_key.display()))?;
+        // The RSA implementation russh pins is open to timing attacks on
+        // private-key operations (RUSTSEC-2023-0071); verifying RSA
+        // signatures, of clients or targets, is not affected.
+        ensure!(
+            !host_key.algorithm().is_rsa(),
+            "host key {}: RSA host keys are refused, use an Ed25519 or ECDSA key",
+            self.host_key.display()
+        );
         let containers = match &self.containers {
             Some(containers) => Some(containers.connect().await?),
             None => None,

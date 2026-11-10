@@ -34,6 +34,10 @@ struct Args {
     /// Configuration file.
     #[arg(short, long, default_value = "/etc/biscuit-ssh/bastion.toml")]
     config: PathBuf,
+    /// Check the configuration, the keys, the revocation lists, and Docker
+    /// when containers are enabled, then exit without listening.
+    #[arg(long)]
+    check: bool,
 }
 
 #[tokio::main]
@@ -42,6 +46,24 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     let settings = Arc::new(config.settings().await?);
+    if args.check {
+        settings.authority.check_revocations()?;
+        if let Some(containers) = &settings.containers {
+            containers.revocations.check()?;
+        }
+        let host_key = settings.host_key.public_key().fingerprint(russh::keys::HashAlg::Sha256);
+        println!(
+            "{}: valid, {} server(s), containers {}, host key {host_key}",
+            args.config.display(),
+            settings.servers.len(),
+            if settings.containers.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+        return Ok(());
+    }
 
     let ssh = Arc::new(russh::server::Config {
         keys: vec![settings.host_key.clone()],

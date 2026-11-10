@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "Token vocabulary, verifier, and revocation lists of biscuit-ssh, SSH access through Biscuit tokens"
+readme = "README.md"
+keywords = ["biscuit", "ssh", "authorization", "token", "datalog"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 biscuit-auth.workspace = true

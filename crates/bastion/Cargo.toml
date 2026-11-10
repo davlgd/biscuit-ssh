@@ -5,12 +5,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "SSH bastion that checks Biscuit tokens and relays sessions to servers and Docker containers, cut when the token stops allowing them"
+readme = "../../README.md"
+keywords = ["biscuit", "ssh", "bastion", "authorization", "jump-host"]
+categories = ["authentication", "network-programming", "command-line-utilities"]
 
 [dependencies]
 anyhow.workspace = true
 biscuit-ssh-core.workspace = true
-biscuit-ssh-service.workspace = true
+biscuit-ssh-service = { workspace = true, features = ["authority"] }
 bollard.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
