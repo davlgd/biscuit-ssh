@@ -106,17 +106,17 @@ Read your Markdown changes as GitHub renders them, at both widths of [Documentat
 
 ## Commit messages
 
-Write the subject on one line, as a capitalized imperative sentence, without a prefix or a body:
+Write the subject on one line, without a body, in the [Conventional Commits](https://www.conventionalcommits.org/) format: a type, an optional scope, then an imperative sentence in lowercase. Types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, and `chore`, and scopes name a crate, such as `bastion`, `cli`, or `service`. A `!` after the type marks a breaking change:
 
 ```text
-Add the bastion: token-checked SSH relay with session leases
-Harden bastion cuts against stalled targets and failed connections
-Send tokens to the bastion in parts, explain refusals and clarify the client
+feat(bastion): add a token-checked SSH relay with session leases
+fix(bastion): harden cuts against stalled targets and failed connections
+chore(release): 0.2.0
 ```
 
 ## Release
 
-A release commit, `Release 0.3.0`, sets the version of the workspace in `Cargo.toml`, and of the internal crates in `[workspace.dependencies]`. It also updates `Cargo.lock`, and moves the *Unreleased* entries of the changelog under the version and its date. Tag the release commit `v0.3.0`.
+A release commit, `chore(release): 0.4.0`, sets the version of the workspace in `Cargo.toml`, and of the internal crates in `[workspace.dependencies]`. It also updates `Cargo.lock`, and moves the *Unreleased* entries of the changelog under the version and its date. Tag the release commit `v0.4.0`.
 
 Each crate carries its own description, keywords, categories, and README. It also carries the license, through a `LICENSE` link to the one of the repository. Before publishing, `cargo publish --workspace --dry-run` packages every crate, then builds each package against the others, as crates.io would serve them.
 
